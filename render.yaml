@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: simple-tracker-whale
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    envVars:
+      - key: ADMIN_USER
+        value: admin
+      - key: ADMIN_PASSWORD
+        value: admin
+      - key: SECRET_KEY
+        generateValue: true
+      - key: MIN_ACCOUNT_VALUE
+        value: "250000"
