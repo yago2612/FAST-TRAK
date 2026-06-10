@@ -1,10 +1,11 @@
 # Simple Tracker Whale
 
-Sistema web simple para rastrear wallets de Hyperliquid desde wallets semilla, guardar las cuentas con balance mayor o igual a USD 250,000 en SQLite y analizar sus posiciones.
+Sistema web simple para rastrear wallets de Hyperliquid desde trades en vivo y wallets semilla, guardar las cuentas con balance mayor o igual a USD 250,000 en SQLite y analizar sus posiciones.
 
 ## Ejecutar localmente
 
 ```bash
+pip install -r requirements.txt
 python app.py
 ```
 
@@ -17,7 +18,17 @@ Credenciales por defecto:
 
 ## Escaneo
 
-La API publica oficial de Hyperliquid permite consultar una wallet conocida con `clearinghouseState`, `portfolio` y `subAccounts`, pero no publica un listado global de todas las wallets. Por eso el sistema parte de wallets semilla y expande subcuentas encontradas.
+La API publica oficial de Hyperliquid permite consultar una wallet conocida con `clearinghouseState`, `portfolio` y `subAccounts`, pero no publica un listado global de todas las wallets.
+
+El metodo principal ahora escucha el WebSocket publico de trades. Cada trade de Hyperliquid incluye `users: [buyer, seller]`, asi que el sistema:
+
+1. Se suscribe a trades en vivo de coins liquidas.
+2. Extrae comprador y vendedor de cada trade.
+3. Rankea las direcciones candidatas por notional operado.
+4. Consulta `clearinghouseState` para esas candidatas.
+5. Guarda solo wallets con `accountValue >= 250000`.
+
+Las wallets semilla siguen existiendo como complemento y para descubrir subcuentas.
 
 Puedes pasar semillas de tres formas:
 
@@ -36,7 +47,12 @@ ADMIN_PASSWORD=admin
 SECRET_KEY=change-me
 DATABASE_PATH=data/hyper_whales.sqlite3
 MIN_ACCOUNT_VALUE=250000
+DISCOVERY_COINS=BTC,ETH,SOL,HYPE,ETHFI
+DISCOVERY_SECONDS=25
+DISCOVERY_MAX_CANDIDATES=80
+DISCOVERY_MIN_TRADE_NOTIONAL=25000
 HYPERLIQUID_INFO_URL=https://api.hyperliquid.xyz/info
+HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws
 HYPERLIQUID_SEED_WALLETS=0x...
 ```
 

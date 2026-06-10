@@ -19,6 +19,11 @@ APP_NAME = "Simple Tracker Whale"
 INFO_URL = os.getenv("HYPERLIQUID_INFO_URL", "https://api.hyperliquid.xyz/info")
 DB_PATH = os.getenv("DATABASE_PATH", os.path.join("data", "hyper_whales.sqlite3"))
 MIN_ACCOUNT_VALUE = float(os.getenv("MIN_ACCOUNT_VALUE", "250000"))
+DISCOVERY_COINS = os.getenv("DISCOVERY_COINS", "BTC,ETH,SOL,HYPE,ETHFI")
+DISCOVERY_SECONDS = int(os.getenv("DISCOVERY_SECONDS", "25"))
+DISCOVERY_MAX_CANDIDATES = int(os.getenv("DISCOVERY_MAX_CANDIDATES", "80"))
+DISCOVERY_MIN_TRADE_NOTIONAL = float(os.getenv("DISCOVERY_MIN_TRADE_NOTIONAL", "25000"))
+WS_URL = os.getenv("HYPERLIQUID_WS_URL", "wss://api.hyperliquid.xyz/ws")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
@@ -174,6 +179,96 @@ def hyperliquid_info(payload):
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.loads(response.read().decode())
+
+
+def discover_wallets_from_live_trades(coins_text="", seconds=None, max_candidates=None, min_notional=None):
+    coins = [coin.strip().upper() for coin in (coins_text or DISCOVERY_COINS).split(",") if coin.strip()]
+    seconds = max(3, min(int(seconds or DISCOVERY_SECONDS), 180))
+    max_candidates = max(1, min(int(max_candidates or DISCOVERY_MAX_CANDIDATES), 500))
+    min_notional = float(min_notional if min_notional not in (None, "") else DISCOVERY_MIN_TRADE_NOTIONAL)
+    stats = {}
+
+    if not coins:
+        return [], {"trades": 0, "coins": [], "errors": ["No hay coins configuradas para escuchar trades."]}
+
+    try:
+        from websocket import WebSocketTimeoutException, create_connection
+    except ImportError:
+        return [], {
+            "trades": 0,
+            "coins": coins,
+            "errors": ["Falta instalar websocket-client para descubrir wallets desde trades."],
+        }
+
+    errors = []
+    trade_count = 0
+    ws = None
+    try:
+        ws = create_connection(WS_URL, timeout=5)
+        ws.settimeout(2)
+        for coin in coins:
+            ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
+
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                message = json.loads(ws.recv())
+            except WebSocketTimeoutException:
+                continue
+            except Exception as exc:
+                errors.append(f"websocket: {exc}")
+                break
+
+            if message.get("channel") != "trades":
+                continue
+            trades = message.get("data") or []
+            if isinstance(trades, dict):
+                trades = [trades]
+            for trade in trades:
+                users = trade.get("users") or []
+                if len(users) != 2:
+                    continue
+                notional = abs(to_float(trade.get("px")) * to_float(trade.get("sz")))
+                if notional < min_notional:
+                    continue
+                trade_count += 1
+                for address in users:
+                    address = str(address or "").lower()
+                    if not ADDRESS_RE.match(address):
+                        continue
+                    item = stats.setdefault(
+                        address,
+                        {
+                            "address": address,
+                            "notional": 0.0,
+                            "trades": 0,
+                            "coins": set(),
+                            "last_seen": 0,
+                        },
+                    )
+                    item["notional"] += notional
+                    item["trades"] += 1
+                    item["coins"].add(str(trade.get("coin") or ""))
+                    item["last_seen"] = max(item["last_seen"], int(trade.get("time") or 0))
+    except Exception as exc:
+        errors.append(f"websocket connect: {exc}")
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    ranked = sorted(stats.values(), key=lambda item: (item["notional"], item["trades"]), reverse=True)
+    candidates = [item["address"] for item in ranked[:max_candidates]]
+    summary = {
+        "trades": trade_count,
+        "coins": coins,
+        "errors": errors,
+        "candidates": len(candidates),
+        "top_notional": ranked[0]["notional"] if ranked else 0,
+    }
+    return candidates, summary
 
 
 def extract_addresses(text):
@@ -373,15 +468,24 @@ def save_wallet(wallet):
         )
 
 
-def scan_wallets(seed_text=""):
+def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery_seconds=None, max_candidates=None):
     started = now_iso()
     seeds = load_seed_wallets(seed_text)
-    queue = list(seeds)
+    live_candidates = []
+    live_summary = {"trades": 0, "coins": [], "errors": [], "candidates": 0, "top_notional": 0}
+    if use_live_discovery:
+        live_candidates, live_summary = discover_wallets_from_live_trades(
+            coins_text=coins_text,
+            seconds=discovery_seconds,
+            max_candidates=max_candidates,
+        )
+
+    queue = list(dict.fromkeys(live_candidates + seeds))
     seen = set()
     scanned_count = 0
     saved_count = 0
-    discovered = set()
-    errors = []
+    discovered = set(live_candidates)
+    errors = list(live_summary.get("errors") or [])
 
     with connect_db() as conn:
         cursor = conn.execute("INSERT INTO scan_runs (started_at) VALUES (?)", (started,))
@@ -430,6 +534,7 @@ def scan_wallets(seed_text=""):
         "scanned": scanned_count,
         "saved": saved_count,
         "discovered": len(discovered),
+        "live": live_summary,
         "errors": errors,
     }
 
@@ -714,6 +819,15 @@ def dashboard(message=""):
       <form method="post" action="/scan" class="card" style="width:min(520px,100%); box-shadow:none;">
         <div class="form-row">
           <textarea name="wallets" placeholder="0x... 0x..."></textarea>
+          <label style="display:flex; align-items:center; gap:8px; color:var(--muted); font-size:13px; font-weight:750;">
+            <input type="checkbox" name="use_live_discovery" value="1" checked style="width:16px; min-height:16px;">
+            Descubrir wallets desde trades en vivo
+          </label>
+          <div class="grid two">
+            <input name="coins" value="{html.escape(DISCOVERY_COINS)}" placeholder="BTC,ETH,SOL,HYPE">
+            <input name="seconds" type="number" min="3" max="180" value="{DISCOVERY_SECONDS}" placeholder="Segundos">
+          </div>
+          <input name="max_candidates" type="number" min="1" max="500" value="{DISCOVERY_MAX_CANDIDATES}" placeholder="Candidatas maximas">
           <button class="btn" type="submit">Escanear wallets</button>
         </div>
       </form>
@@ -964,8 +1078,16 @@ class AppHandler(BaseHTTPRequestHandler):
             self.redirect("/login")
             return
         if parsed.path == "/scan":
-            result = scan_wallets(form.get("wallets", ""))
-            msg = f"Escaneo listo: {result['scanned']} revisadas, {result['saved']} guardadas, {result['discovered']} subcuentas descubiertas."
+            result = scan_wallets(
+                form.get("wallets", ""),
+                use_live_discovery=form.get("use_live_discovery") == "1",
+                coins_text=form.get("coins", ""),
+                discovery_seconds=form.get("seconds") or None,
+                max_candidates=form.get("max_candidates") or None,
+            )
+            msg = f"Escaneo listo: {result['scanned']} revisadas, {result['saved']} guardadas, {result['discovered']} candidatas descubiertas."
+            if result.get("live", {}).get("candidates"):
+                msg += f" Trades live: {result['live']['candidates']} candidatas desde {result['live']['trades']} trades."
             if result["errors"]:
                 msg += f" Errores: {len(result['errors'])}."
             self.redirect("/?message=" + urllib.parse.quote(msg))
