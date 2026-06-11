@@ -490,6 +490,7 @@ def parse_wallet(address, state, source):
 def save_wallet(wallet):
     seen = now_iso()
     with connect_db() as conn:
+        existed = conn.execute("SELECT 1 FROM wallets WHERE address = ?", (wallet["address"],)).fetchone() is not None
         conn.execute(
             """
             INSERT INTO wallets (
@@ -585,6 +586,7 @@ def save_wallet(wallet):
                 seen,
             ),
         )
+    return not existed
 
 
 def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery_seconds=None, max_candidates=None):
@@ -603,6 +605,10 @@ def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery
     seen = set()
     scanned_count = 0
     saved_count = 0
+    new_count = 0
+    updated_count = 0
+    duplicate_count = 0
+    below_min_count = 0
     discovered = set(live_candidates)
     errors = list(live_summary.get("errors") or [])
 
@@ -620,8 +626,15 @@ def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery
             state = hyperliquid_info({"type": "clearinghouseState", "user": address})
             wallet = parse_wallet(address, state, "seed" if address in seeds else "subaccount")
             if wallet["account_value"] >= MIN_ACCOUNT_VALUE:
-                save_wallet(wallet)
+                is_new = save_wallet(wallet)
                 saved_count += 1
+                if is_new:
+                    new_count += 1
+                else:
+                    updated_count += 1
+                    duplicate_count += 1
+            else:
+                below_min_count += 1
 
             try:
                 subaccounts = hyperliquid_info({"type": "subAccounts", "user": address}) or []
@@ -647,11 +660,15 @@ def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery
                 discovered_count = ?, errors = ?
             WHERE id = ?
             """,
-            (finished, scanned_count, saved_count, len(discovered), "\n".join(errors[-25:]), run_id),
+            (finished, scanned_count, new_count, len(discovered), "\n".join(errors[-25:]), run_id),
         )
     return {
         "scanned": scanned_count,
         "saved": saved_count,
+        "new": new_count,
+        "updated": updated_count,
+        "duplicates": duplicate_count,
+        "below_min": below_min_count,
         "discovered": len(discovered),
         "live": live_summary,
         "errors": errors,
@@ -720,7 +737,7 @@ def auto_worker():
             if AUTO_DISCOVERY_ENABLED and time.monotonic() >= next_discovery:
                 result = scan_wallets(use_live_discovery=True)
                 AUTO_STATUS["last_discovery"] = (
-                    f"{now_iso()} | {result['discovered']} candidatas | {result['saved']} guardadas"
+                    f"{now_iso()} | {result['discovered']} candidatas | {result['new']} nuevas | {result['updated']} repetidas"
                 )
                 if result["errors"]:
                     AUTO_STATUS["last_error"] = "; ".join(result["errors"][-3:])
@@ -1039,7 +1056,7 @@ def dashboard(message=""):
     )
     scan_copy = "Nunca"
     if last_scan:
-        scan_copy = f"{last_scan['finished_at'] or last_scan['started_at']} | escaneadas {last_scan['scanned_count']} | guardadas {last_scan['saved_count']}"
+        scan_copy = f"{last_scan['finished_at'] or last_scan['started_at']} | escaneadas {last_scan['scanned_count']} | nuevas {last_scan['saved_count']}"
     body = f"""
     <div class="topbar">
       <div>
@@ -1497,7 +1514,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 discovery_seconds=form.get("seconds") or None,
                 max_candidates=form.get("max_candidates") or None,
             )
-            msg = f"Escaneo listo: {result['scanned']} revisadas, {result['saved']} guardadas, {result['discovered']} candidatas descubiertas."
+            msg = (
+                f"Escaneo listo: {result['discovered']} candidatas, {result['scanned']} revisadas, "
+                f"{result['new']} nuevas, {result['updated']} repetidas actualizadas, "
+                f"{result['below_min']} descartadas bajo ${MIN_ACCOUNT_VALUE:,.0f}."
+            )
             if result.get("live", {}).get("candidates"):
                 msg += f" Trades live: {result['live']['candidates']} candidatas desde {result['live']['trades']} trades."
             if result["errors"]:
