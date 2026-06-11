@@ -38,6 +38,13 @@ Puedes pasar semillas de tres formas:
 
 Solo se guardan en la base las wallets cuyo `accountValue` sea mayor o igual a `MIN_ACCOUNT_VALUE`, que por defecto es `250000`.
 
+## Vistas
+
+- Dashboard general: resumen macro, top wallets y formulario de escaneo.
+- Wallets: listado filtrable por direccion, coin y sesgo.
+- Perfil de wallet: balance, posiciones, exposicion, snapshots y detalle por moneda.
+- Tendencias: analisis del top 5 por balance neto + valor en posiciones.
+
 ## Variables de entorno
 
 ```bash

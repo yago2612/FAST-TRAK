@@ -552,6 +552,7 @@ def q_all(query, params=()):
 def render_layout(title, body, active="dashboard", message=""):
     nav = [
         ("dashboard", "/", "Dashboard"),
+        ("wallets", "/wallets", "Wallets"),
         ("trends", "/trends", "Tendencias"),
     ]
     links = "".join(
@@ -855,6 +856,103 @@ def dashboard(message=""):
     return render_layout("Dashboard", body, "dashboard", message)
 
 
+def wallets_page(query="", bias=""):
+    query = (query or "").strip()
+    bias = (bias or "").strip()
+    params = []
+    where = []
+    if query:
+        like = f"%{query.lower()}%"
+        where.append(
+            """
+            (
+                LOWER(w.address) LIKE ?
+                OR EXISTS (
+                    SELECT 1 FROM positions p
+                    WHERE p.wallet_address = w.address AND LOWER(p.coin) LIKE ?
+                )
+            )
+            """
+        )
+        params.extend([like, like])
+    if bias in {"Alcista", "Bajista", "Neutral"}:
+        where.append("w.direction_bias = ?")
+        params.append(bias)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    rows = q_all(
+        f"""
+        SELECT w.*,
+               GROUP_CONCAT(DISTINCT p.coin) coins
+        FROM wallets w
+        LEFT JOIN positions p ON p.wallet_address = w.address
+        {where_sql}
+        GROUP BY w.address
+        ORDER BY (w.account_value + w.total_ntl_pos) DESC
+        LIMIT 250
+        """,
+        tuple(params),
+    )
+    total_value = sum(row["account_value"] + row["total_ntl_pos"] for row in rows)
+    total_exposure = sum(row["gross_exposure"] for row in rows)
+    total_active = sum(row["active_positions"] for row in rows)
+    options = "".join(
+        f'<option value="{value}" {"selected" if bias == value else ""}>{label}</option>'
+        for value, label in [("", "Todos"), ("Alcista", "Alcistas"), ("Bajista", "Bajistas"), ("Neutral", "Neutrales")]
+    )
+    trs = []
+    for row in rows:
+        coins = ", ".join((row["coins"] or "").split(",")[:5]) or "-"
+        total = row["account_value"] + row["total_ntl_pos"]
+        trs.append(
+            "<tr>"
+            f"<td>{wallet_link(row['address'])}<div class='subtle'>{html.escape(row['address'])}</div></td>"
+            f"<td>{usd(row['account_value'])}</td>"
+            f"<td>{usd(row['total_ntl_pos'])}</td>"
+            f"<td>{usd(total)}</td>"
+            f"<td>{usd(row['long_value'])}</td>"
+            f"<td>{usd(row['short_value'])}</td>"
+            f"<td>{int(row['active_positions'])}</td>"
+            f"<td>{badge(row['direction_bias'])}</td>"
+            f"<td>{html.escape(coins)}</td>"
+            f"<td>{html.escape(row['last_seen'])}</td>"
+            "</tr>"
+        )
+    body = f"""
+    <div class="topbar">
+      <div>
+        <h1>Wallets</h1>
+        <div class="subtle">Listado filtrable de whales guardadas</div>
+      </div>
+      <form method="get" action="/wallets" class="card" style="width:min(620px,100%); box-shadow:none;">
+        <div class="grid two">
+          <input name="q" value="{html.escape(query)}" placeholder="Buscar wallet o coin">
+          <select name="bias" style="width:100%; border:1px solid var(--line); border-radius:8px; padding:11px 12px; font:inherit; background:#fff; color:var(--ink);">
+            {options}
+          </select>
+        </div>
+        <div style="display:flex; gap:10px; margin-top:10px;">
+          <button class="btn" type="submit">Filtrar</button>
+          <a class="btn secondary" href="/wallets">Limpiar</a>
+        </div>
+      </form>
+    </div>
+    <section class="grid metrics">
+      <div class="card"><div class="metric-label">Wallets visibles</div><div class="metric-value">{len(rows)}</div></div>
+      <div class="card"><div class="metric-label">Total balance + posiciones</div><div class="metric-value">{usd(total_value)}</div></div>
+      <div class="card"><div class="metric-label">Exposicion bruta</div><div class="metric-value">{usd(total_exposure)}</div></div>
+      <div class="card"><div class="metric-label">Posiciones activas</div><div class="metric-value">{int(total_active)}</div></div>
+    </section>
+    <section class="card">
+      <h2>Listado</h2>
+      <div class="table-wrap"><table><thead><tr>
+        <th>Wallet</th><th>Balance</th><th>Posiciones</th><th>Total</th>
+        <th>Long</th><th>Short</th><th>Activas</th><th>Sesgo</th><th>Coins</th><th>Actualizada</th>
+      </tr></thead><tbody>{''.join(trs) or '<tr><td colspan="10">Sin wallets guardadas.</td></tr>'}</tbody></table></div>
+    </section>
+    """
+    return render_layout("Wallets", body, "wallets")
+
+
 def wallet_profile(address):
     address = address.lower()
     wallet = q_one("SELECT * FROM wallets WHERE address = ?", (address,))
@@ -1054,6 +1152,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             message = urllib.parse.parse_qs(parsed.query).get("message", [""])[0]
             self.send_html(dashboard(message))
+            return
+        if parsed.path == "/wallets":
+            query = urllib.parse.parse_qs(parsed.query)
+            self.send_html(wallets_page(query.get("q", [""])[0], query.get("bias", [""])[0]))
             return
         if parsed.path == "/trends":
             self.send_html(trends())
