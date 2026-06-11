@@ -54,6 +54,7 @@ Mientras el servicio esta despierto, la app arranca un worker interno que:
 - descubre nuevas candidatas desde trades cada `AUTO_DISCOVERY_INTERVAL` segundos;
 - recalcula balance, posiciones, precio actual derivado, margen usado, uPnL y ROI.
 - registra aperturas/cierres comparando contra un estado estable; los cierres requieren `POSITION_CLOSE_CONFIRMATIONS` lecturas consecutivas ausentes para evitar falsos positivos por respuestas incompletas.
+- usa `metaAndAssetCtxs` para tomar el `markPx` oficial de Hyperliquid; solo usa `positionValue / tamano` como fallback.
 
 En Render Free esto no es 24/7 garantizado porque el servicio puede dormirse, reiniciarse o perder SQLite local. Para monitoreo serio conviene Render pago + Postgres + worker separado.
 

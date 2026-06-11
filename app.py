@@ -306,6 +306,26 @@ def hyperliquid_info(payload):
         return json.loads(response.read().decode())
 
 
+def fetch_mark_prices():
+    try:
+        data = hyperliquid_info({"type": "metaAndAssetCtxs"})
+    except Exception:
+        return {}
+    if not isinstance(data, list) or len(data) < 2:
+        return {}
+    meta, asset_contexts = data[0], data[1]
+    universe = (meta or {}).get("universe") or []
+    prices = {}
+    for asset, context in zip(universe, asset_contexts or []):
+        coin = asset.get("name") if isinstance(asset, dict) else None
+        if not coin or not isinstance(context, dict):
+            continue
+        mark_px = to_float(context.get("markPx"))
+        if mark_px > 0:
+            prices[str(coin)] = mark_px
+    return prices
+
+
 def discover_wallets_from_live_trades(coins_text="", seconds=None, max_candidates=None, min_notional=None):
     coins = [coin.strip().upper() for coin in (coins_text or DISCOVERY_COINS).split(",") if coin.strip()]
     seconds = max(3, min(int(seconds or DISCOVERY_SECONDS), 180))
@@ -414,7 +434,8 @@ def load_seed_wallets(extra_text=""):
     return sorted(seeds)
 
 
-def parse_wallet(address, state, source):
+def parse_wallet(address, state, source, mark_prices=None):
+    mark_prices = mark_prices or {}
     margin = state.get("marginSummary") or {}
     cross = state.get("crossMarginSummary") or {}
     account_value = to_float(margin.get("accountValue", cross.get("accountValue")))
@@ -433,10 +454,13 @@ def parse_wallet(address, state, source):
         coin = str(position.get("coin") or "UNKNOWN")
         size = to_float(position.get("szi"))
         entry_px = to_float(position.get("entryPx"))
-        position_value = abs(to_float(position.get("positionValue")))
+        api_position_value = abs(to_float(position.get("positionValue")))
+        current_px = to_float(mark_prices.get(coin))
+        if current_px <= 0 and size:
+            current_px = api_position_value / abs(size) if api_position_value > 0 else 0.0
+        position_value = abs(size * current_px) if current_px > 0 and size else api_position_value
         if position_value <= 0 and size:
             position_value = abs(size * entry_px)
-        current_px = position_value / abs(size) if size else 0.0
         side = "Long" if size > 0 else "Short" if size < 0 else "Flat"
         if side == "Long":
             long_value += position_value
@@ -808,6 +832,7 @@ def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery
     below_min_count = 0
     discovered = set(live_candidates)
     errors = list(live_summary.get("errors") or [])
+    mark_prices = fetch_mark_prices()
 
     with connect_db() as conn:
         cursor = conn.execute("INSERT INTO scan_runs (started_at) VALUES (?)", (started,))
@@ -821,7 +846,7 @@ def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery
         scanned_count += 1
         try:
             state = hyperliquid_info({"type": "clearinghouseState", "user": address})
-            wallet = parse_wallet(address, state, "seed" if address in seeds else "subaccount")
+            wallet = parse_wallet(address, state, "seed" if address in seeds else "subaccount", mark_prices)
             if wallet["account_value"] >= MIN_ACCOUNT_VALUE:
                 is_new = save_wallet(wallet)
                 saved_count += 1
@@ -893,12 +918,13 @@ def save_wallet_alias(address, alias):
         conn.execute("UPDATE wallets SET alias = ? WHERE address = ?", (alias, address.lower()))
 
 
-def refresh_wallet_state(address, source="refresh"):
+def refresh_wallet_state(address, source="refresh", mark_prices=None):
     address = (address or "").lower()
     if not ADDRESS_RE.match(address):
         return False
+    mark_prices = mark_prices if mark_prices is not None else fetch_mark_prices()
     state = hyperliquid_info({"type": "clearinghouseState", "user": address})
-    wallet = parse_wallet(address, state, source)
+    wallet = parse_wallet(address, state, source, mark_prices)
     save_wallet(wallet)
     return True
 
@@ -911,9 +937,10 @@ def refresh_saved_wallets(batch_size=None):
     )
     refreshed = 0
     errors = []
+    mark_prices = fetch_mark_prices()
     for wallet in wallets:
         try:
-            if refresh_wallet_state(wallet["address"], "auto-refresh"):
+            if refresh_wallet_state(wallet["address"], "auto-refresh", mark_prices):
                 refreshed += 1
         except Exception as exc:
             errors.append(f"{short_addr(wallet['address'])}: {exc}")
@@ -1592,7 +1619,7 @@ def wallet_profile(address):
         {th('Notional', 'Valor total de la posicion en USD: tamano aproximado por precio actual. Es el valor apalancado.')}
         {th('Margen usado', 'Margen/capital actualmente usado por la posicion segun Hyperliquid. En cross puede depender del margen compartido de la cuenta.')}
         {th('Entry px', 'Precio promedio de entrada de la posicion.')}
-        {th('Mark px', 'Precio actual estimado desde positionValue dividido entre tamano.')}
+        {th('Mark px', 'Precio mark oficial de Hyperliquid desde metaAndAssetCtxs. Si no esta disponible, se usa positionValue dividido entre tamano como fallback.')}
         {th('uPnL', 'Ganancia o perdida no realizada recibida desde Hyperliquid.')}
         {th('ROI precio', 'Movimiento porcentual del precio desde entry, ajustado por Long o Short, sin apalancamiento.')}
         {th('ROI margen', 'uPnL dividido entre margen usado. Es el retorno sobre el capital/margen empleado.')}
