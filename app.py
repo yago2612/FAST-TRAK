@@ -91,6 +91,14 @@ def price(value):
     return f"${value:,.{decimals}f}"
 
 
+def price_or_dash(value):
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return "-" if value <= 0 else price(value)
+
+
 def signed_usd(value):
     try:
         value = float(value or 0)
@@ -934,6 +942,10 @@ def wallet_link(address, label=None):
     return f'<a href="/wallet/{safe}">{html.escape(label or short_addr(address))}</a>'
 
 
+def th(label, description):
+    return f'<th title="{html.escape(description)}">{html.escape(label)}</th>'
+
+
 def render_wallet_table(rows, value_key="account_value"):
     if not rows:
         return '<div class="subtle">Sin datos guardados todavia.</div>'
@@ -1164,7 +1176,7 @@ def wallet_profile(address):
             f"<td>{signed_pct(pos['roi_price'])}</td>"
             f"<td>{signed_pct(pos['roi_capital'])}</td>"
             f"<td>{html.escape(pos['leverage'] or '-')}</td>"
-            f"<td>{price(pos['liquidation_px'])}</td>"
+            f"<td>{price_or_dash(pos['liquidation_px'])}</td>"
             "</tr>"
         )
     snap_rows = "".join(
@@ -1199,13 +1211,13 @@ def wallet_profile(address):
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Balance</div><div class="metric-value">{usd(wallet['account_value'])}</div></div>
       <div class="card"><div class="metric-label">Posiciones</div><div class="metric-value">{usd(wallet['total_ntl_pos'])}</div></div>
-      <div class="card"><div class="metric-label">Capital real en posiciones</div><div class="metric-value">{usd(total_capital)}</div></div>
+      <div class="card"><div class="metric-label">Margen usado posiciones</div><div class="metric-value">{usd(total_capital)}</div></div>
       <div class="card"><div class="metric-label">uPnL agregado</div><div class="metric-value">{usd(total_pnl)}</div></div>
     </section>
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Exposicion neta</div><div class="metric-value">{usd(wallet['net_exposure'])}</div></div>
       <div class="card"><div class="metric-label">Sesgo</div><div class="metric-value">{badge(wallet['direction_bias'])}</div></div>
-      <div class="card"><div class="metric-label">ROI sobre capital</div><div class="metric-value">{signed_pct(total_pnl / total_capital if total_capital else 0)}</div></div>
+      <div class="card"><div class="metric-label">ROI sobre margen</div><div class="metric-value">{signed_pct(total_pnl / total_capital if total_capital else 0)}</div></div>
       <div class="card"><div class="metric-label">Posiciones activas</div><div class="metric-value">{int(wallet['active_positions'])}</div></div>
     </section>
     <section class="card">
@@ -1222,7 +1234,20 @@ def wallet_profile(address):
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Posiciones por moneda</h2>
-      <div class="table-wrap"><table><thead><tr><th>Coin</th><th>Lado</th><th>Tamano abs.</th><th>Valor apal.</th><th>Capital real</th><th>Entrada</th><th>Actual</th><th>uPnL</th><th>ROI precio</th><th>ROI capital</th><th>Lev</th><th>Liq.</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="12">Sin posiciones activas</td></tr>'}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr>
+        {th('Coin', 'Mercado perpetuo de la posicion.')}
+        {th('Lado', 'Long gana si el precio sube; Short gana si el precio baja.')}
+        {th('Tamano coin', 'Cantidad absoluta del activo. La API entrega szi con signo; aqui el signo lo representa Lado.')}
+        {th('Notional', 'Valor total de la posicion en USD: tamano aproximado por precio actual. Es el valor apalancado.')}
+        {th('Margen usado', 'Margen/capital actualmente usado por la posicion segun Hyperliquid. En cross puede depender del margen compartido de la cuenta.')}
+        {th('Entry px', 'Precio promedio de entrada de la posicion.')}
+        {th('Mark px', 'Precio actual estimado desde positionValue dividido entre tamano.')}
+        {th('uPnL', 'Ganancia o perdida no realizada recibida desde Hyperliquid.')}
+        {th('ROI precio', 'Movimiento porcentual del precio desde entry, ajustado por Long o Short, sin apalancamiento.')}
+        {th('ROI margen', 'uPnL dividido entre margen usado. Es el retorno sobre el capital/margen empleado.')}
+        {th('Lev', 'Apalancamiento y tipo de margen reportado por Hyperliquid, por ejemplo cross 5x.')}
+        {th('Liq.', 'Precio de liquidacion recibido desde Hyperliquid. No lo calculamos. En cross puede estar influido por todo el margen de la cuenta.')}
+      </tr></thead><tbody>{''.join(rows) or '<tr><td colspan="12">Sin posiciones activas</td></tr>'}</tbody></table></div>
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Snapshots</h2>
