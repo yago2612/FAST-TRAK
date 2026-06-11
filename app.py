@@ -30,6 +30,7 @@ AUTO_DISCOVERY_INTERVAL = int(os.getenv("AUTO_DISCOVERY_INTERVAL", "180"))
 AUTO_REFRESH_INTERVAL = float(os.getenv("AUTO_REFRESH_INTERVAL", "5"))
 AUTO_REFRESH_BATCH = int(os.getenv("AUTO_REFRESH_BATCH", "5"))
 POSITION_EVENT_EPSILON = float(os.getenv("POSITION_EVENT_EPSILON", "0.00000001"))
+POSITION_CLOSE_CONFIRMATIONS = int(os.getenv("POSITION_CLOSE_CONFIRMATIONS", "2"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
@@ -237,6 +238,21 @@ def init_db():
                 unrealized_pnl REAL NOT NULL DEFAULT 0,
                 source TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS position_state (
+                wallet_address TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                size REAL NOT NULL DEFAULT 0,
+                entry_px REAL NOT NULL DEFAULT 0,
+                current_px REAL NOT NULL DEFAULT 0,
+                position_value REAL NOT NULL DEFAULT 0,
+                capital_used REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                missing_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(wallet_address, coin, side)
             );
             """
         )
@@ -563,7 +579,7 @@ def save_wallet(wallet):
                 wallet["raw_json"],
             ),
         )
-        record_position_events(conn, wallet, previous_positions, seen)
+        sync_position_state_and_events(conn, wallet, previous_positions, seen)
         conn.execute("DELETE FROM positions WHERE wallet_address = ?", (wallet["address"],))
         for position in wallet["positions"]:
             conn.execute(
@@ -662,25 +678,112 @@ def insert_position_event(conn, wallet_address, event_type, position, source, cr
     )
 
 
-def record_position_events(conn, wallet, previous_rows, created_at):
-    if not previous_rows:
-        return
-    previous = {
-        position_key(row_to_position(row)): row_to_position(row)
-        for row in previous_rows
-        if is_active_position(row_to_position(row))
+def upsert_position_state(conn, wallet_address, position, missing_count, updated_at):
+    conn.execute(
+        """
+        INSERT INTO position_state (
+            wallet_address, coin, side, size, entry_px, current_px,
+            position_value, capital_used, unrealized_pnl, missing_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(wallet_address, coin, side) DO UPDATE SET
+            size=excluded.size,
+            entry_px=excluded.entry_px,
+            current_px=excluded.current_px,
+            position_value=excluded.position_value,
+            capital_used=excluded.capital_used,
+            unrealized_pnl=excluded.unrealized_pnl,
+            missing_count=excluded.missing_count,
+            updated_at=excluded.updated_at
+        """,
+        (
+            wallet_address,
+            position["coin"],
+            position["side"],
+            to_float(position["size"]),
+            to_float(position["entry_px"]),
+            to_float(position["current_px"]),
+            to_float(position["position_value"]),
+            to_float(position["capital_used"]),
+            to_float(position["unrealized_pnl"]),
+            missing_count,
+            updated_at,
+        ),
+    )
+
+
+def state_row_to_position(row):
+    return {
+        "coin": row["coin"],
+        "side": row["side"],
+        "size": row["size"],
+        "entry_px": row["entry_px"],
+        "current_px": row["current_px"],
+        "position_value": row["position_value"],
+        "capital_used": row["capital_used"],
+        "unrealized_pnl": row["unrealized_pnl"],
+        "missing_count": row["missing_count"],
     }
+
+
+def sync_position_state_and_events(conn, wallet, previous_rows, created_at):
+    state_rows = conn.execute(
+        """
+        SELECT coin, side, size, entry_px, current_px, position_value,
+               capital_used, unrealized_pnl, missing_count
+        FROM position_state
+        WHERE wallet_address = ?
+        """,
+        (wallet["address"],),
+    ).fetchall()
+
     current = {
         position_key(position): position
         for position in wallet["positions"]
         if is_active_position(position)
     }
+
+    if not state_rows:
+        baseline_rows = previous_rows or []
+        baseline = {
+            position_key(row_to_position(row)): row_to_position(row)
+            for row in baseline_rows
+            if is_active_position(row_to_position(row))
+        }
+        baseline.update(current)
+        for position in baseline.values():
+            upsert_position_state(conn, wallet["address"], position, 0, created_at)
+        return
+
+    previous = {
+        position_key(state_row_to_position(row)): state_row_to_position(row)
+        for row in state_rows
+        if is_active_position(state_row_to_position(row))
+    }
+
     for key, position in current.items():
         if key not in previous:
             insert_position_event(conn, wallet["address"], "open", position, wallet["source"], created_at)
+        upsert_position_state(conn, wallet["address"], position, 0, created_at)
+
     for key, position in previous.items():
         if key not in current:
-            insert_position_event(conn, wallet["address"], "close", position, wallet["source"], created_at)
+            flipped_same_coin = any(current_position["coin"] == position["coin"] for current_position in current.values())
+            if flipped_same_coin:
+                insert_position_event(conn, wallet["address"], "close", position, wallet["source"], created_at)
+                conn.execute(
+                    "DELETE FROM position_state WHERE wallet_address = ? AND coin = ? AND side = ?",
+                    (wallet["address"], position["coin"], position["side"]),
+                )
+                continue
+            missing_count = int(position.get("missing_count") or 0) + 1
+            if missing_count >= POSITION_CLOSE_CONFIRMATIONS:
+                insert_position_event(conn, wallet["address"], "close", position, wallet["source"], created_at)
+                conn.execute(
+                    "DELETE FROM position_state WHERE wallet_address = ? AND coin = ? AND side = ?",
+                    (wallet["address"], position["coin"], position["side"]),
+                )
+            else:
+                upsert_position_state(conn, wallet["address"], position, missing_count, created_at)
 
 
 def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery_seconds=None, max_candidates=None):

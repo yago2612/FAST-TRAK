@@ -53,6 +53,7 @@ Mientras el servicio esta despierto, la app arranca un worker interno que:
 - refresca wallets guardadas cada `AUTO_REFRESH_INTERVAL` segundos, por defecto 5;
 - descubre nuevas candidatas desde trades cada `AUTO_DISCOVERY_INTERVAL` segundos;
 - recalcula balance, posiciones, precio actual derivado, margen usado, uPnL y ROI.
+- registra aperturas/cierres comparando contra un estado estable; los cierres requieren `POSITION_CLOSE_CONFIRMATIONS` lecturas consecutivas ausentes para evitar falsos positivos por respuestas incompletas.
 
 En Render Free esto no es 24/7 garantizado porque el servicio puede dormirse, reiniciarse o perder SQLite local. Para monitoreo serio conviene Render pago + Postgres + worker separado.
 
@@ -73,6 +74,7 @@ AUTO_DISCOVERY_ENABLED=1
 AUTO_DISCOVERY_INTERVAL=180
 AUTO_REFRESH_INTERVAL=5
 AUTO_REFRESH_BATCH=5
+POSITION_CLOSE_CONFIRMATIONS=2
 HYPERLIQUID_INFO_URL=https://api.hyperliquid.xyz/info
 HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws
 HYPERLIQUID_SEED_WALLETS=0x...

@@ -22,3 +22,5 @@ services:
         value: "5"
       - key: AUTO_REFRESH_BATCH
         value: "5"
+      - key: POSITION_CLOSE_CONFIRMATIONS
+        value: "2"
