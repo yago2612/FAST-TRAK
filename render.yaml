@@ -14,3 +14,11 @@ services:
         generateValue: true
       - key: MIN_ACCOUNT_VALUE
         value: "250000"
+      - key: AUTO_DISCOVERY_ENABLED
+        value: "1"
+      - key: AUTO_DISCOVERY_INTERVAL
+        value: "180"
+      - key: AUTO_REFRESH_INTERVAL
+        value: "10"
+      - key: AUTO_REFRESH_BATCH
+        value: "5"

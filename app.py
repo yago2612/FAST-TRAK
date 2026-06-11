@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -24,10 +25,20 @@ DISCOVERY_SECONDS = int(os.getenv("DISCOVERY_SECONDS", "25"))
 DISCOVERY_MAX_CANDIDATES = int(os.getenv("DISCOVERY_MAX_CANDIDATES", "80"))
 DISCOVERY_MIN_TRADE_NOTIONAL = float(os.getenv("DISCOVERY_MIN_TRADE_NOTIONAL", "25000"))
 WS_URL = os.getenv("HYPERLIQUID_WS_URL", "wss://api.hyperliquid.xyz/ws")
+AUTO_DISCOVERY_ENABLED = os.getenv("AUTO_DISCOVERY_ENABLED", "1") == "1"
+AUTO_DISCOVERY_INTERVAL = int(os.getenv("AUTO_DISCOVERY_INTERVAL", "180"))
+AUTO_REFRESH_INTERVAL = int(os.getenv("AUTO_REFRESH_INTERVAL", "10"))
+AUTO_REFRESH_BATCH = int(os.getenv("AUTO_REFRESH_BATCH", "5"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+AUTO_STATUS = {
+    "started": False,
+    "last_refresh": "",
+    "last_discovery": "",
+    "last_error": "",
+}
 
 
 def now_iso():
@@ -85,6 +96,7 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS wallets (
                 address TEXT PRIMARY KEY,
+                alias TEXT NOT NULL DEFAULT '',
                 account_value REAL NOT NULL DEFAULT 0,
                 total_ntl_pos REAL NOT NULL DEFAULT 0,
                 total_raw_usd REAL NOT NULL DEFAULT 0,
@@ -110,10 +122,15 @@ def init_db():
                 side TEXT NOT NULL,
                 size REAL NOT NULL DEFAULT 0,
                 entry_px REAL NOT NULL DEFAULT 0,
+                current_px REAL NOT NULL DEFAULT 0,
                 position_value REAL NOT NULL DEFAULT 0,
+                capital_used REAL NOT NULL DEFAULT 0,
                 unrealized_pnl REAL NOT NULL DEFAULT 0,
+                roi_price REAL NOT NULL DEFAULT 0,
+                roi_capital REAL NOT NULL DEFAULT 0,
                 return_on_equity REAL NOT NULL DEFAULT 0,
                 leverage TEXT,
+                leverage_value REAL NOT NULL DEFAULT 0,
                 liquidation_px REAL NOT NULL DEFAULT 0,
                 margin_used REAL NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
@@ -143,6 +160,18 @@ def init_db():
             );
             """
         )
+        ensure_column(conn, "wallets", "alias", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "positions", "current_px", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "positions", "capital_used", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "positions", "roi_price", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "positions", "roi_capital", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "positions", "leverage_value", "REAL NOT NULL DEFAULT 0")
+
+
+def ensure_column(conn, table, column, definition):
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def sign_payload(payload):
@@ -307,9 +336,11 @@ def parse_wallet(address, state, source):
         position = item.get("position") or {}
         coin = str(position.get("coin") or "UNKNOWN")
         size = to_float(position.get("szi"))
+        entry_px = to_float(position.get("entryPx"))
         position_value = abs(to_float(position.get("positionValue")))
         if position_value <= 0 and size:
-            position_value = abs(size * to_float(position.get("entryPx")))
+            position_value = abs(size * entry_px)
+        current_px = position_value / abs(size) if size else 0.0
         side = "Long" if size > 0 else "Short" if size < 0 else "Flat"
         if side == "Long":
             long_value += position_value
@@ -317,22 +348,41 @@ def parse_wallet(address, state, source):
             short_value += position_value
         coin_values[coin] = coin_values.get(coin, 0.0) + position_value
         leverage = position.get("leverage") or {}
+        leverage_value = 0.0
         if isinstance(leverage, dict):
+            leverage_value = to_float(leverage.get("value"))
             leverage_label = f"{leverage.get('type', 'cross')} {leverage.get('value', '')}x".strip()
         else:
             leverage_label = str(leverage or "")
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)", leverage_label)
+            leverage_value = to_float(match.group(1)) if match else 0.0
+        margin_used_pos = to_float(position.get("marginUsed"))
+        capital_used = margin_used_pos if margin_used_pos > 0 else position_value / leverage_value if leverage_value > 0 else 0.0
+        unrealized_pnl = to_float(position.get("unrealizedPnl"))
+        if entry_px > 0 and current_px > 0 and side == "Long":
+            roi_price = (current_px - entry_px) / entry_px
+        elif entry_px > 0 and current_px > 0 and side == "Short":
+            roi_price = (entry_px - current_px) / entry_px
+        else:
+            roi_price = 0.0
+        roi_capital = unrealized_pnl / capital_used if capital_used else 0.0
         parsed_positions.append(
             {
                 "coin": coin,
                 "side": side,
                 "size": size,
-                "entry_px": to_float(position.get("entryPx")),
+                "entry_px": entry_px,
+                "current_px": current_px,
                 "position_value": position_value,
-                "unrealized_pnl": to_float(position.get("unrealizedPnl")),
+                "capital_used": capital_used,
+                "unrealized_pnl": unrealized_pnl,
+                "roi_price": roi_price,
+                "roi_capital": roi_capital,
                 "return_on_equity": to_float(position.get("returnOnEquity")),
                 "leverage": leverage_label,
+                "leverage_value": leverage_value,
                 "liquidation_px": to_float(position.get("liquidationPx")),
-                "margin_used": to_float(position.get("marginUsed")),
+                "margin_used": margin_used_pos,
             }
         )
 
@@ -428,10 +478,11 @@ def save_wallet(wallet):
             conn.execute(
                 """
                 INSERT INTO positions (
-                    wallet_address, coin, side, size, entry_px, position_value,
-                    unrealized_pnl, return_on_equity, leverage, liquidation_px,
-                    margin_used, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    wallet_address, coin, side, size, entry_px, current_px,
+                    position_value, capital_used, unrealized_pnl, roi_price,
+                    roi_capital, return_on_equity, leverage, leverage_value,
+                    liquidation_px, margin_used, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     wallet["address"],
@@ -439,10 +490,15 @@ def save_wallet(wallet):
                     position["side"],
                     position["size"],
                     position["entry_px"],
+                    position["current_px"],
                     position["position_value"],
+                    position["capital_used"],
                     position["unrealized_pnl"],
+                    position["roi_price"],
+                    position["roi_capital"],
                     position["return_on_equity"],
                     position["leverage"],
+                    position["leverage_value"],
                     position["liquidation_px"],
                     position["margin_used"],
                     seen,
@@ -547,6 +603,75 @@ def q_one(query, params=()):
 def q_all(query, params=()):
     with connect_db() as conn:
         return conn.execute(query, params).fetchall()
+
+
+def wallet_name(wallet):
+    alias = wallet["alias"] if "alias" in wallet.keys() else ""
+    return alias.strip() or short_addr(wallet["address"])
+
+
+def save_wallet_alias(address, alias):
+    alias = (alias or "").strip()[:80]
+    with connect_db() as conn:
+        conn.execute("UPDATE wallets SET alias = ? WHERE address = ?", (alias, address.lower()))
+
+
+def refresh_wallet_state(address, source="refresh"):
+    address = (address or "").lower()
+    if not ADDRESS_RE.match(address):
+        return False
+    state = hyperliquid_info({"type": "clearinghouseState", "user": address})
+    wallet = parse_wallet(address, state, source)
+    save_wallet(wallet)
+    return True
+
+
+def refresh_saved_wallets(batch_size=None):
+    batch_size = max(1, int(batch_size or AUTO_REFRESH_BATCH))
+    wallets = q_all(
+        "SELECT address FROM wallets ORDER BY last_seen ASC LIMIT ?",
+        (batch_size,),
+    )
+    refreshed = 0
+    errors = []
+    for wallet in wallets:
+        try:
+            if refresh_wallet_state(wallet["address"], "auto-refresh"):
+                refreshed += 1
+        except Exception as exc:
+            errors.append(f"{short_addr(wallet['address'])}: {exc}")
+        time.sleep(0.15)
+    return refreshed, errors
+
+
+def auto_worker():
+    AUTO_STATUS["started"] = True
+    next_discovery = time.monotonic() + 5
+    while True:
+        try:
+            refreshed, errors = refresh_saved_wallets()
+            AUTO_STATUS["last_refresh"] = f"{now_iso()} | {refreshed} wallets"
+            if errors:
+                AUTO_STATUS["last_error"] = "; ".join(errors[-3:])
+
+            if AUTO_DISCOVERY_ENABLED and time.monotonic() >= next_discovery:
+                result = scan_wallets(use_live_discovery=True)
+                AUTO_STATUS["last_discovery"] = (
+                    f"{now_iso()} | {result['discovered']} candidatas | {result['saved']} guardadas"
+                )
+                if result["errors"]:
+                    AUTO_STATUS["last_error"] = "; ".join(result["errors"][-3:])
+                next_discovery = time.monotonic() + max(60, AUTO_DISCOVERY_INTERVAL)
+        except Exception as exc:
+            AUTO_STATUS["last_error"] = str(exc)
+        time.sleep(max(3, AUTO_REFRESH_INTERVAL))
+
+
+def start_auto_worker():
+    if AUTO_STATUS["started"]:
+        return
+    thread = threading.Thread(target=auto_worker, name="wallet-auto-worker", daemon=True)
+    thread.start()
 
 
 def render_layout(title, body, active="dashboard", message=""):
@@ -746,9 +871,9 @@ def badge(text):
     return f'<span class="badge {cls}">{html.escape(str(text))}</span>'
 
 
-def wallet_link(address):
+def wallet_link(address, label=None):
     safe = html.escape(address)
-    return f'<a href="/wallet/{safe}">{short_addr(address)}</a>'
+    return f'<a href="/wallet/{safe}">{html.escape(label or short_addr(address))}</a>'
 
 
 def render_wallet_table(rows, value_key="account_value"):
@@ -759,7 +884,7 @@ def render_wallet_table(rows, value_key="account_value"):
         total = row["account_value"] + row["total_ntl_pos"]
         trs.append(
             "<tr>"
-            f"<td>{wallet_link(row['address'])}</td>"
+            f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{short_addr(row['address'])}</div></td>"
             f"<td>{usd(row['account_value'])}</td>"
             f"<td>{usd(row['total_ntl_pos'])}</td>"
             f"<td>{usd(total)}</td>"
@@ -816,6 +941,7 @@ def dashboard(message=""):
       <div>
         <h1>Dashboard general</h1>
         <div class="subtle">Ultimo escaneo: {html.escape(scan_copy)}</div>
+        <div class="subtle">Worker: refresh {html.escape(AUTO_STATUS['last_refresh'] or 'pendiente')} | discovery {html.escape(AUTO_STATUS['last_discovery'] or 'pendiente')}</div>
       </div>
       <form method="post" action="/scan" class="card" style="width:min(520px,100%); box-shadow:none;">
         <div class="form-row">
@@ -905,7 +1031,7 @@ def wallets_page(query="", bias=""):
         total = row["account_value"] + row["total_ntl_pos"]
         trs.append(
             "<tr>"
-            f"<td>{wallet_link(row['address'])}<div class='subtle'>{html.escape(row['address'])}</div></td>"
+            f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{html.escape(row['address'])}</div></td>"
             f"<td>{usd(row['account_value'])}</td>"
             f"<td>{usd(row['total_ntl_pos'])}</td>"
             f"<td>{usd(total)}</td>"
@@ -964,6 +1090,8 @@ def wallet_profile(address):
         (address,),
     )
     rows = []
+    total_capital = sum(pos["capital_used"] for pos in positions)
+    total_pnl = sum(pos["unrealized_pnl"] for pos in positions)
     for pos in positions:
         rows.append(
             "<tr>"
@@ -971,9 +1099,12 @@ def wallet_profile(address):
             f"<td>{badge(pos['side'])}</td>"
             f"<td>{pos['size']:,.6f}</td>"
             f"<td>{usd(pos['position_value'])}</td>"
+            f"<td>{usd(pos['capital_used'])}</td>"
             f"<td>{usd(pos['entry_px'])}</td>"
+            f"<td>{usd(pos['current_px'])}</td>"
             f"<td>{usd(pos['unrealized_pnl'])}</td>"
-            f"<td>{pct(pos['return_on_equity'])}</td>"
+            f"<td>{pct(pos['roi_price'])}</td>"
+            f"<td>{pct(pos['roi_capital'])}</td>"
             f"<td>{html.escape(pos['leverage'] or '-')}</td>"
             f"<td>{usd(pos['liquidation_px'])}</td>"
             "</tr>"
@@ -990,16 +1121,34 @@ def wallet_profile(address):
     body = f"""
     <div class="topbar">
       <div>
-        <h1>{html.escape(short_addr(address))}</h1>
+        <h1>{html.escape(wallet_name(wallet))}</h1>
         <div class="subtle">{html.escape(address)}</div>
+        <div class="subtle">Auto-refresh UI: 10s | Worker: {html.escape(AUTO_STATUS['last_refresh'] or 'esperando datos')}</div>
       </div>
-      <a class="btn secondary" href="/">Volver</a>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <form method="post" action="/wallet/{html.escape(address)}/refresh">
+          <button class="btn secondary" type="submit">Refrescar</button>
+        </form>
+        <a class="btn secondary" href="/wallets">Volver</a>
+      </div>
     </div>
+    <section class="card" style="margin-bottom:16px;">
+      <form method="post" action="/wallet/{html.escape(address)}/name" class="grid two">
+        <input name="alias" value="{html.escape(wallet['alias'] or '')}" placeholder="Nombre para esta wallet">
+        <button class="btn" type="submit">Guardar nombre</button>
+      </form>
+    </section>
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Balance</div><div class="metric-value">{usd(wallet['account_value'])}</div></div>
       <div class="card"><div class="metric-label">Posiciones</div><div class="metric-value">{usd(wallet['total_ntl_pos'])}</div></div>
+      <div class="card"><div class="metric-label">Capital real en posiciones</div><div class="metric-value">{usd(total_capital)}</div></div>
+      <div class="card"><div class="metric-label">uPnL agregado</div><div class="metric-value">{usd(total_pnl)}</div></div>
+    </section>
+    <section class="grid metrics">
       <div class="card"><div class="metric-label">Exposicion neta</div><div class="metric-value">{usd(wallet['net_exposure'])}</div></div>
       <div class="card"><div class="metric-label">Sesgo</div><div class="metric-value">{badge(wallet['direction_bias'])}</div></div>
+      <div class="card"><div class="metric-label">ROI sobre capital</div><div class="metric-value">{pct(total_pnl / total_capital if total_capital else 0)}</div></div>
+      <div class="card"><div class="metric-label">Posiciones activas</div><div class="metric-value">{int(wallet['active_positions'])}</div></div>
     </section>
     <section class="grid two">
       <div class="card">
@@ -1021,8 +1170,16 @@ def wallet_profile(address):
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Posiciones por moneda</h2>
-      <div class="table-wrap"><table><thead><tr><th>Coin</th><th>Lado</th><th>Tamano</th><th>Valor</th><th>Entrada</th><th>uPnL</th><th>ROE</th><th>Lev</th><th>Liq.</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="9">Sin posiciones activas</td></tr>'}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Coin</th><th>Lado</th><th>Tamano</th><th>Valor apal.</th><th>Capital real</th><th>Entrada</th><th>Actual</th><th>uPnL</th><th>ROI precio</th><th>ROI capital</th><th>Lev</th><th>Liq.</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="12">Sin posiciones activas</td></tr>'}</tbody></table></div>
     </section>
+    <script>
+      setInterval(function () {{
+        var active = document.activeElement;
+        if (!active || !['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {{
+          window.location.reload();
+        }}
+      }}, 10000);
+    </script>
     """
     return render_layout("Wallet", body, "dashboard")
 
@@ -1082,7 +1239,7 @@ def trends():
         for row in coin_rows
     )
     cards = "".join(
-        f'<div class="card"><h2>{wallet_link(row["address"])}</h2><div class="subtle">{html.escape(trend_sentence(row))}</div>'
+        f'<div class="card"><h2>{wallet_link(row["address"], wallet_name(row))}</h2><div class="subtle">{html.escape(trend_sentence(row))}</div>'
         f'<table style="margin-top:12px;"><tbody><tr><th>Total</th><td>{usd(row["account_value"] + row["total_ntl_pos"])}</td></tr>'
         f'<tr><th>Long</th><td>{usd(row["long_value"])}</td></tr><tr><th>Short</th><td>{usd(row["short_value"])}</td></tr>'
         f'<tr><th>Diversificacion</th><td>{pct(row["diversification_score"])}</td></tr></tbody></table></div>'
@@ -1179,6 +1336,25 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self.is_authed():
             self.redirect("/login")
             return
+        if parsed.path.startswith("/wallet/") and parsed.path.endswith("/name"):
+            address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/name", 1)[0]).lower()
+            if ADDRESS_RE.match(address):
+                save_wallet_alias(address, form.get("alias", ""))
+                self.redirect(f"/wallet/{address}")
+            else:
+                self.redirect("/wallets")
+            return
+        if parsed.path.startswith("/wallet/") and parsed.path.endswith("/refresh"):
+            address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/refresh", 1)[0]).lower()
+            if ADDRESS_RE.match(address):
+                try:
+                    refresh_wallet_state(address, "manual-refresh")
+                except Exception:
+                    pass
+                self.redirect(f"/wallet/{address}")
+            else:
+                self.redirect("/wallets")
+            return
         if parsed.path == "/scan":
             result = scan_wallets(
                 form.get("wallets", ""),
@@ -1199,6 +1375,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+    start_auto_worker()
     port = int(os.getenv("PORT", "8000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), AppHandler)
     print(f"{APP_NAME} running on http://localhost:{port}")
