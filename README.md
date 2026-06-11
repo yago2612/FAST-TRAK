@@ -40,10 +40,10 @@ Solo se guardan en la base las wallets cuyo `accountValue` sea mayor o igual a `
 
 ## Vistas
 
-- Dashboard general: resumen macro, top wallets y formulario de escaneo.
+- Dashboard general: resumen macro, top wallets por balance/margen y formulario de escaneo.
 - Wallets: listado filtrable por direccion, coin y sesgo.
 - Perfil de wallet: alias editable, balance, posiciones, exposicion, snapshots y detalle por moneda.
-- Tendencias: analisis del top 5 por balance neto + valor en posiciones.
+- Tendencias: analisis del top 5 por balance neto + margen usado en posiciones.
 
 ## Modo semi real-time
 

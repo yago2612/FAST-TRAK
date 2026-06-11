@@ -104,7 +104,7 @@ def signed_usd(value):
         value = float(value or 0)
     except (TypeError, ValueError):
         value = 0
-    sign = "+" if value > 0 else "-" if value < 0 else ""
+    sign = "+" if value > 0 else ""
     cls = "num-positive" if value > 0 else "num-negative" if value < 0 else "num-neutral"
     return f'<span class="{cls}">{sign}{usd(abs(value))}</span>'
 
@@ -114,7 +114,7 @@ def signed_full_usd(value):
         value = float(value or 0)
     except (TypeError, ValueError):
         value = 0
-    sign = "+" if value > 0 else "-" if value < 0 else ""
+    sign = "+" if value > 0 else ""
     cls = "num-positive" if value > 0 else "num-negative" if value < 0 else "num-neutral"
     return f'<span class="{cls}">{sign}{full_usd(abs(value))}</span>'
 
@@ -124,7 +124,7 @@ def signed_pct(value, decimals=2):
         value = float(value or 0)
     except (TypeError, ValueError):
         value = 0
-    sign = "+" if value > 0 else "-" if value < 0 else ""
+    sign = "+" if value > 0 else ""
     cls = "num-positive" if value > 0 else "num-negative" if value < 0 else "num-neutral"
     return f'<span class="{cls}">{sign}{pct(abs(value), decimals)}</span>'
 
@@ -946,16 +946,49 @@ def th(label, description):
     return f'<th title="{html.escape(description)}">{html.escape(label)}</th>'
 
 
+def render_account_pnl_chart(snapshots):
+    if len(snapshots) < 2:
+        return '<div class="subtle">Aun no hay suficientes snapshots para graficar PnL historico.</div>'
+    values = [to_float(row["account_value"]) for row in snapshots]
+    base = values[0]
+    pnls = [value - base for value in values]
+    min_pnl = min(pnls)
+    max_pnl = max(pnls)
+    span = max(max_pnl - min_pnl, 1)
+    width = 760
+    height = 220
+    pad_x = 28
+    pad_y = 24
+    points = []
+    for idx, pnl_value in enumerate(pnls):
+        x = pad_x + (width - pad_x * 2) * (idx / max(len(pnls) - 1, 1))
+        y = height - pad_y - ((pnl_value - min_pnl) / span) * (height - pad_y * 2)
+        points.append(f"{x:.1f},{y:.1f}")
+    zero_y = height - pad_y - ((0 - min_pnl) / span) * (height - pad_y * 2)
+    last_pnl = pnls[-1]
+    line_color = "#14865f" if last_pnl >= 0 else "#b43b4a"
+    return f"""
+      <svg viewBox="0 0 {width} {height}" role="img" aria-label="Grafico de PnL de cuenta" style="width:100%; height:240px;">
+        <line x1="{pad_x}" y1="{zero_y:.1f}" x2="{width - pad_x}" y2="{zero_y:.1f}" stroke="#dfe5ef" stroke-width="1" />
+        <polyline points="{' '.join(points)}" fill="none" stroke="{line_color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+        <circle cx="{points[-1].split(',')[0]}" cy="{points[-1].split(',')[1]}" r="5" fill="{line_color}" />
+        <text x="{pad_x}" y="18" fill="#647086" font-size="12">Inicio {full_usd(base)}</text>
+        <text x="{width - pad_x}" y="18" text-anchor="end" fill="{line_color}" font-size="12">PnL {('+' if last_pnl > 0 else '') + full_usd(abs(last_pnl))}</text>
+      </svg>
+    """
+
+
 def render_wallet_table(rows, value_key="account_value"):
     if not rows:
         return '<div class="subtle">Sin datos guardados todavia.</div>'
     trs = []
     for row in rows:
-        total = row["account_value"] + row["total_ntl_pos"]
+        total = row["account_value"] + row["margin_used"]
         trs.append(
             "<tr>"
             f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{short_addr(row['address'])}</div></td>"
             f"<td>{usd(row['account_value'])}</td>"
+            f"<td>{usd(row['margin_used'])}</td>"
             f"<td>{usd(row['total_ntl_pos'])}</td>"
             f"<td>{usd(total)}</td>"
             f"<td>{int(row['active_positions'])}</td>"
@@ -965,7 +998,7 @@ def render_wallet_table(rows, value_key="account_value"):
         )
     return (
         '<div class="table-wrap"><table><thead><tr>'
-        "<th>Wallet</th><th>Balance</th><th>Posiciones</th><th>Total</th>"
+        "<th>Wallet</th><th>Balance</th><th>Margen pos.</th><th>Notional</th><th>Balance + margen</th>"
         "<th>Activas</th><th>Sesgo</th><th>Top coin</th>"
         "</tr></thead><tbody>"
         + "".join(trs)
@@ -979,6 +1012,7 @@ def dashboard(message=""):
         SELECT COUNT(*) wallet_count,
                COALESCE(SUM(account_value), 0) account_value,
                COALESCE(SUM(total_ntl_pos), 0) total_ntl_pos,
+               COALESCE(SUM(margin_used), 0) margin_used,
                COALESCE(SUM(long_value), 0) long_value,
                COALESCE(SUM(short_value), 0) short_value,
                COALESCE(AVG(active_positions), 0) avg_positions
@@ -988,7 +1022,7 @@ def dashboard(message=""):
     last_scan = q_one("SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1")
     top_balance = q_all("SELECT * FROM wallets ORDER BY account_value DESC LIMIT 5")
     top_active = q_all("SELECT * FROM wallets ORDER BY active_positions DESC, account_value DESC LIMIT 5")
-    top_positions = q_all("SELECT * FROM wallets ORDER BY total_ntl_pos DESC LIMIT 5")
+    top_positions = q_all("SELECT * FROM wallets ORDER BY margin_used DESC LIMIT 5")
     coins = q_all(
         """
         SELECT coin, SUM(position_value) value, COUNT(*) n
@@ -1032,15 +1066,15 @@ def dashboard(message=""):
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Wallets encontradas</div><div class="metric-value">{int(stats['wallet_count'])}</div></div>
       <div class="card"><div class="metric-label">Balance agregado</div><div class="metric-value">{usd(stats['account_value'])}</div></div>
-      <div class="card"><div class="metric-label">Valor en posiciones</div><div class="metric-value">{usd(stats['total_ntl_pos'])}</div></div>
+      <div class="card"><div class="metric-label">Margen en posiciones</div><div class="metric-value">{usd(stats['margin_used'])}</div></div>
       <div class="card"><div class="metric-label">Posiciones promedio</div><div class="metric-value">{float(stats['avg_positions']):.1f}</div></div>
     </section>
     <section class="grid two">
       <div class="card"><h2>Top 5 por balance</h2>{render_wallet_table(top_balance)}</div>
       <div class="card"><h2>Top 5 por posiciones activas</h2>{render_wallet_table(top_active)}</div>
-      <div class="card"><h2>Top 5 por valor en posiciones</h2>{render_wallet_table(top_positions)}</div>
+      <div class="card"><h2>Top 5 por margen en posiciones</h2>{render_wallet_table(top_positions)}</div>
       <div class="card">
-        <h2>Macro de exposicion</h2>
+        <h2>Macro de exposicion notional</h2>
         <div class="grid two" style="margin-bottom:14px;">
           <div><div class="metric-label">Long</div><div class="metric-value">{usd(stats['long_value'])}</div></div>
           <div><div class="metric-label">Short</div><div class="metric-value">{usd(stats['short_value'])}</div></div>
@@ -1083,12 +1117,13 @@ def wallets_page(query="", bias=""):
         LEFT JOIN positions p ON p.wallet_address = w.address
         {where_sql}
         GROUP BY w.address
-        ORDER BY (w.account_value + w.total_ntl_pos) DESC
+        ORDER BY (w.account_value + w.margin_used) DESC
         LIMIT 250
         """,
         tuple(params),
     )
-    total_value = sum(row["account_value"] + row["total_ntl_pos"] for row in rows)
+    total_value = sum(row["account_value"] + row["margin_used"] for row in rows)
+    total_margin = sum(row["margin_used"] for row in rows)
     total_exposure = sum(row["gross_exposure"] for row in rows)
     total_active = sum(row["active_positions"] for row in rows)
     options = "".join(
@@ -1098,11 +1133,12 @@ def wallets_page(query="", bias=""):
     trs = []
     for row in rows:
         coins = ", ".join((row["coins"] or "").split(",")[:5]) or "-"
-        total = row["account_value"] + row["total_ntl_pos"]
+        total = row["account_value"] + row["margin_used"]
         trs.append(
             "<tr>"
             f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{html.escape(row['address'])}</div></td>"
             f"<td>{usd(row['account_value'])}</td>"
+            f"<td>{usd(row['margin_used'])}</td>"
             f"<td>{usd(row['total_ntl_pos'])}</td>"
             f"<td>{usd(total)}</td>"
             f"<td>{usd(row['long_value'])}</td>"
@@ -1134,16 +1170,16 @@ def wallets_page(query="", bias=""):
     </div>
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Wallets visibles</div><div class="metric-value">{len(rows)}</div></div>
-      <div class="card"><div class="metric-label">Total balance + posiciones</div><div class="metric-value">{usd(total_value)}</div></div>
-      <div class="card"><div class="metric-label">Exposicion bruta</div><div class="metric-value">{usd(total_exposure)}</div></div>
+      <div class="card"><div class="metric-label">Balance + margen</div><div class="metric-value">{usd(total_value)}</div></div>
+      <div class="card"><div class="metric-label">Margen posiciones</div><div class="metric-value">{usd(total_margin)}</div></div>
       <div class="card"><div class="metric-label">Posiciones activas</div><div class="metric-value">{int(total_active)}</div></div>
     </section>
     <section class="card">
       <h2>Listado</h2>
       <div class="table-wrap"><table><thead><tr>
-        <th>Wallet</th><th>Balance</th><th>Posiciones</th><th>Total</th>
-        <th>Long</th><th>Short</th><th>Activas</th><th>Sesgo</th><th>Coins</th><th>Actualizada</th>
-      </tr></thead><tbody>{''.join(trs) or '<tr><td colspan="10">Sin wallets guardadas.</td></tr>'}</tbody></table></div>
+        <th>Wallet</th><th>Balance</th><th>Margen pos.</th><th>Notional</th><th>Balance + margen</th>
+        <th>Long notional</th><th>Short notional</th><th>Activas</th><th>Sesgo</th><th>Coins</th><th>Actualizada</th>
+      </tr></thead><tbody>{''.join(trs) or '<tr><td colspan="11">Sin wallets guardadas.</td></tr>'}</tbody></table></div>
     </section>
     """
     return render_layout("Wallets", body, "wallets")
@@ -1157,6 +1193,17 @@ def wallet_profile(address):
     positions = q_all("SELECT * FROM positions WHERE wallet_address = ? ORDER BY position_value DESC", (address,))
     snapshots = q_all(
         "SELECT * FROM wallet_snapshots WHERE wallet_address = ? ORDER BY id DESC LIMIT 3",
+        (address,),
+    )
+    chart_snapshots = q_all(
+        """
+        SELECT * FROM (
+            SELECT * FROM wallet_snapshots
+            WHERE wallet_address = ?
+            ORDER BY id DESC
+            LIMIT 48
+        ) ORDER BY id ASC
+        """,
         (address,),
     )
     rows = []
@@ -1210,12 +1257,12 @@ def wallet_profile(address):
     </section>
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Balance</div><div class="metric-value">{usd(wallet['account_value'])}</div></div>
-      <div class="card"><div class="metric-label">Posiciones</div><div class="metric-value">{usd(wallet['total_ntl_pos'])}</div></div>
+      <div class="card"><div class="metric-label">Notional abierto</div><div class="metric-value">{usd(wallet['total_ntl_pos'])}</div></div>
       <div class="card"><div class="metric-label">Margen usado posiciones</div><div class="metric-value">{usd(total_capital)}</div></div>
-      <div class="card"><div class="metric-label">uPnL agregado</div><div class="metric-value">{usd(total_pnl)}</div></div>
+      <div class="card"><div class="metric-label">uPnL agregado</div><div class="metric-value">{signed_usd(total_pnl)}</div></div>
     </section>
     <section class="grid metrics">
-      <div class="card"><div class="metric-label">Exposicion neta</div><div class="metric-value">{usd(wallet['net_exposure'])}</div></div>
+      <div class="card"><div class="metric-label">Exposicion neta</div><div class="metric-value">{signed_usd(wallet['net_exposure'])}</div></div>
       <div class="card"><div class="metric-label">Sesgo</div><div class="metric-value">{badge(wallet['direction_bias'])}</div></div>
       <div class="card"><div class="metric-label">ROI sobre margen</div><div class="metric-value">{signed_pct(total_pnl / total_capital if total_capital else 0)}</div></div>
       <div class="card"><div class="metric-label">Posiciones activas</div><div class="metric-value">{int(wallet['active_positions'])}</div></div>
@@ -1231,6 +1278,11 @@ def wallet_profile(address):
         <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
         <tr><th>Ultima lectura</th><td>{html.escape(wallet['last_seen'])}</td></tr>
       </tbody></table>
+    </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>PnL de cuenta</h2>
+      <div class="subtle">Variacion de account value contra el primer snapshot visible del grafico.</div>
+      {render_account_pnl_chart(chart_snapshots)}
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Posiciones por moneda</h2>
@@ -1266,7 +1318,7 @@ def wallet_profile(address):
 
 
 def trend_sentence(wallet):
-    total = wallet["account_value"] + wallet["total_ntl_pos"]
+    total = wallet["account_value"] + wallet["margin_used"]
     concentration = 1 - float(wallet["diversification_score"])
     if concentration >= 0.65:
         diversification = f"concentrada en {wallet['top_coin'] or 'una moneda'}"
@@ -1275,7 +1327,7 @@ def trend_sentence(wallet):
     else:
         diversification = "moderadamente diversificada"
     exposure = "sin gran exposicion" if wallet["gross_exposure"] <= 0 else f"con {usd(wallet['gross_exposure'])} en mercado"
-    return f"{short_addr(wallet['address'])} esta {wallet['direction_bias'].lower()}, {diversification}, {exposure}; total observado {usd(total)}."
+    return f"{short_addr(wallet['address'])} esta {wallet['direction_bias'].lower()}, {diversification}, {exposure}; balance + margen observado {usd(total)}."
 
 
 def trends():
@@ -1283,7 +1335,7 @@ def trends():
         """
         SELECT *
         FROM wallets
-        ORDER BY (account_value + total_ntl_pos) DESC
+        ORDER BY (account_value + margin_used) DESC
         LIMIT 5
         """
     )
@@ -1306,7 +1358,7 @@ def trends():
                COUNT(DISTINCT p.wallet_address) wallets
         FROM positions p
         JOIN (
-            SELECT address FROM wallets ORDER BY (account_value + total_ntl_pos) DESC LIMIT 5
+            SELECT address FROM wallets ORDER BY (account_value + margin_used) DESC LIMIT 5
         ) w ON w.address = p.wallet_address
         GROUP BY p.coin
         ORDER BY total_value DESC
@@ -1321,7 +1373,8 @@ def trends():
     )
     cards = "".join(
         f'<div class="card"><h2>{wallet_link(row["address"], wallet_name(row))}</h2><div class="subtle">{html.escape(trend_sentence(row))}</div>'
-        f'<table style="margin-top:12px;"><tbody><tr><th>Total</th><td>{usd(row["account_value"] + row["total_ntl_pos"])}</td></tr>'
+        f'<table style="margin-top:12px;"><tbody><tr><th>Balance + margen</th><td>{usd(row["account_value"] + row["margin_used"])}</td></tr>'
+        f'<tr><th>Notional</th><td>{usd(row["total_ntl_pos"])}</td></tr>'
         f'<tr><th>Long</th><td>{usd(row["long_value"])}</td></tr><tr><th>Short</th><td>{usd(row["short_value"])}</td></tr>'
         f'<tr><th>Diversificacion</th><td>{pct(row["diversification_score"])}</td></tr></tbody></table></div>'
         for row in top
@@ -1330,13 +1383,13 @@ def trends():
     <div class="topbar">
       <div>
         <h1>Tendencias top 5</h1>
-        <div class="subtle">Criterio: balance neto + valor en posiciones</div>
+        <div class="subtle">Criterio: balance neto + margen usado en posiciones</div>
       </div>
     </div>
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Lectura macro</div><div class="metric-value">{badge(macro)}</div></div>
-      <div class="card"><div class="metric-label">Long top 5</div><div class="metric-value">{usd(total_long)}</div></div>
-      <div class="card"><div class="metric-label">Short top 5</div><div class="metric-value">{usd(total_short)}</div></div>
+      <div class="card"><div class="metric-label">Long notional top 5</div><div class="metric-value">{usd(total_long)}</div></div>
+      <div class="card"><div class="metric-label">Short notional top 5</div><div class="metric-value">{usd(total_short)}</div></div>
       <div class="card"><div class="metric-label">Sesgo neto</div><div class="metric-value">{pct(net_ratio)}</div></div>
     </section>
     <section class="grid two">
