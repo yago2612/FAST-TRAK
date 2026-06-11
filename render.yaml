@@ -19,6 +19,6 @@ services:
       - key: AUTO_DISCOVERY_INTERVAL
         value: "180"
       - key: AUTO_REFRESH_INTERVAL
-        value: "10"
+        value: "5"
       - key: AUTO_REFRESH_BATCH
         value: "5"

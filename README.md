@@ -42,6 +42,7 @@ Solo se guardan en la base las wallets cuyo `accountValue` sea mayor o igual a `
 
 - Dashboard general: resumen macro, top wallets por balance/margen y formulario de escaneo.
 - Wallets: listado filtrable por direccion, coin y sesgo.
+- Actividad: aperturas y cierres detectados en wallets guardadas.
 - Perfil de wallet: alias editable, balance, posiciones, exposicion, snapshots y detalle por moneda.
 - Tendencias: analisis del top 5 por balance neto + margen usado en posiciones.
 
@@ -49,9 +50,9 @@ Solo se guardan en la base las wallets cuyo `accountValue` sea mayor o igual a `
 
 Mientras el servicio esta despierto, la app arranca un worker interno que:
 
-- refresca wallets guardadas cada `AUTO_REFRESH_INTERVAL` segundos;
+- refresca wallets guardadas cada `AUTO_REFRESH_INTERVAL` segundos, por defecto 5;
 - descubre nuevas candidatas desde trades cada `AUTO_DISCOVERY_INTERVAL` segundos;
-- recalcula balance, posiciones, precio actual derivado, capital real, uPnL y ROI.
+- recalcula balance, posiciones, precio actual derivado, margen usado, uPnL y ROI.
 
 En Render Free esto no es 24/7 garantizado porque el servicio puede dormirse, reiniciarse o perder SQLite local. Para monitoreo serio conviene Render pago + Postgres + worker separado.
 
@@ -70,7 +71,7 @@ DISCOVERY_MAX_CANDIDATES=80
 DISCOVERY_MIN_TRADE_NOTIONAL=25000
 AUTO_DISCOVERY_ENABLED=1
 AUTO_DISCOVERY_INTERVAL=180
-AUTO_REFRESH_INTERVAL=10
+AUTO_REFRESH_INTERVAL=5
 AUTO_REFRESH_BATCH=5
 HYPERLIQUID_INFO_URL=https://api.hyperliquid.xyz/info
 HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws

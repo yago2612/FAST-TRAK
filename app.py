@@ -27,8 +27,9 @@ DISCOVERY_MIN_TRADE_NOTIONAL = float(os.getenv("DISCOVERY_MIN_TRADE_NOTIONAL", "
 WS_URL = os.getenv("HYPERLIQUID_WS_URL", "wss://api.hyperliquid.xyz/ws")
 AUTO_DISCOVERY_ENABLED = os.getenv("AUTO_DISCOVERY_ENABLED", "1") == "1"
 AUTO_DISCOVERY_INTERVAL = int(os.getenv("AUTO_DISCOVERY_INTERVAL", "180"))
-AUTO_REFRESH_INTERVAL = int(os.getenv("AUTO_REFRESH_INTERVAL", "10"))
+AUTO_REFRESH_INTERVAL = float(os.getenv("AUTO_REFRESH_INTERVAL", "5"))
 AUTO_REFRESH_BATCH = int(os.getenv("AUTO_REFRESH_BATCH", "5"))
+POSITION_EVENT_EPSILON = float(os.getenv("POSITION_EVENT_EPSILON", "0.00000001"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
@@ -220,6 +221,22 @@ def init_db():
                 saved_count INTEGER NOT NULL DEFAULT 0,
                 discovered_count INTEGER NOT NULL DEFAULT 0,
                 errors TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS position_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                size REAL NOT NULL DEFAULT 0,
+                entry_px REAL NOT NULL DEFAULT 0,
+                current_px REAL NOT NULL DEFAULT 0,
+                notional REAL NOT NULL DEFAULT 0,
+                margin_used REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                source TEXT,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -491,6 +508,15 @@ def save_wallet(wallet):
     seen = now_iso()
     with connect_db() as conn:
         existed = conn.execute("SELECT 1 FROM wallets WHERE address = ?", (wallet["address"],)).fetchone() is not None
+        previous_positions = conn.execute(
+            """
+            SELECT coin, side, size, entry_px, current_px, position_value,
+                   capital_used, unrealized_pnl
+            FROM positions
+            WHERE wallet_address = ?
+            """,
+            (wallet["address"],),
+        ).fetchall()
         conn.execute(
             """
             INSERT INTO wallets (
@@ -537,6 +563,7 @@ def save_wallet(wallet):
                 wallet["raw_json"],
             ),
         )
+        record_position_events(conn, wallet, previous_positions, seen)
         conn.execute("DELETE FROM positions WHERE wallet_address = ?", (wallet["address"],))
         for position in wallet["positions"]:
             conn.execute(
@@ -587,6 +614,73 @@ def save_wallet(wallet):
             ),
         )
     return not existed
+
+
+def position_key(position):
+    return str(position["coin"]), str(position["side"])
+
+
+def is_active_position(position):
+    return str(position["side"]) in {"Long", "Short"} and abs(to_float(position["size"])) > POSITION_EVENT_EPSILON
+
+
+def row_to_position(row):
+    return {
+        "coin": row["coin"],
+        "side": row["side"],
+        "size": row["size"],
+        "entry_px": row["entry_px"],
+        "current_px": row["current_px"],
+        "position_value": row["position_value"],
+        "capital_used": row["capital_used"],
+        "unrealized_pnl": row["unrealized_pnl"],
+    }
+
+
+def insert_position_event(conn, wallet_address, event_type, position, source, created_at):
+    conn.execute(
+        """
+        INSERT INTO position_events (
+            wallet_address, event_type, coin, side, size, entry_px,
+            current_px, notional, margin_used, unrealized_pnl, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            wallet_address,
+            event_type,
+            position["coin"],
+            position["side"],
+            abs(to_float(position["size"])),
+            to_float(position["entry_px"]),
+            to_float(position["current_px"]),
+            to_float(position["position_value"]),
+            to_float(position["capital_used"]),
+            to_float(position["unrealized_pnl"]),
+            source,
+            created_at,
+        ),
+    )
+
+
+def record_position_events(conn, wallet, previous_rows, created_at):
+    if not previous_rows:
+        return
+    previous = {
+        position_key(row_to_position(row)): row_to_position(row)
+        for row in previous_rows
+        if is_active_position(row_to_position(row))
+    }
+    current = {
+        position_key(position): position
+        for position in wallet["positions"]
+        if is_active_position(position)
+    }
+    for key, position in current.items():
+        if key not in previous:
+            insert_position_event(conn, wallet["address"], "open", position, wallet["source"], created_at)
+    for key, position in previous.items():
+        if key not in current:
+            insert_position_event(conn, wallet["address"], "close", position, wallet["source"], created_at)
 
 
 def scan_wallets(seed_text="", use_live_discovery=True, coins_text="", discovery_seconds=None, max_candidates=None):
@@ -744,7 +838,7 @@ def auto_worker():
                 next_discovery = time.monotonic() + max(60, AUTO_DISCOVERY_INTERVAL)
         except Exception as exc:
             AUTO_STATUS["last_error"] = str(exc)
-        time.sleep(max(3, AUTO_REFRESH_INTERVAL))
+        time.sleep(max(1.0, AUTO_REFRESH_INTERVAL))
 
 
 def start_auto_worker():
@@ -758,6 +852,7 @@ def render_layout(title, body, active="dashboard", message=""):
     nav = [
         ("dashboard", "/", "Dashboard"),
         ("wallets", "/wallets", "Wallets"),
+        ("events", "/events", "Actividad"),
         ("trends", "/trends", "Tendencias"),
     ]
     links = "".join(
@@ -1023,6 +1118,59 @@ def render_wallet_table(rows, value_key="account_value"):
     )
 
 
+def event_badge(event_type):
+    if event_type == "open":
+        return '<span class="badge bull">Apertura</span>'
+    if event_type == "close":
+        return '<span class="badge bear">Cierre</span>'
+    return f'<span class="badge neutral">{html.escape(event_type)}</span>'
+
+
+def fetch_position_events(limit=30):
+    return q_all(
+        """
+        SELECT e.*, w.alias
+        FROM position_events e
+        LEFT JOIN wallets w ON w.address = e.wallet_address
+        ORDER BY e.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def render_events_table(events, compact=False):
+    if not events:
+        return '<div class="subtle">Sin eventos de apertura/cierre todavia.</div>'
+    rows = []
+    for event in events:
+        label = event["alias"] or short_addr(event["wallet_address"])
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(event['created_at'])}</td>"
+            f"<td>{event_badge(event['event_type'])}</td>"
+            f"<td>{wallet_link(event['wallet_address'], label)}<div class='subtle'>{short_addr(event['wallet_address'])}</div></td>"
+            f"<td>{html.escape(event['coin'])}</td>"
+            f"<td>{badge(event['side'])}</td>"
+            f"<td>{event['size']:,.6f}</td>"
+            f"<td>{full_usd(event['notional'])}</td>"
+            f"<td>{full_usd(event['margin_used'])}</td>"
+            f"<td>{price_or_dash(event['entry_px'])}</td>"
+            f"<td>{price_or_dash(event['current_px'])}</td>"
+            "</tr>"
+        )
+    limit_note = '<div class="subtle" style="margin-top:10px;"><a href="/events">Ver toda la actividad</a></div>' if compact else ""
+    return (
+        '<div class="table-wrap"><table><thead><tr>'
+        '<th>Fecha</th><th>Evento</th><th>Wallet</th><th>Coin</th><th>Lado</th>'
+        '<th>Tamano coin</th><th>Notional</th><th>Margen</th><th>Entry px</th><th>Mark px</th>'
+        '</tr></thead><tbody>'
+        + "".join(rows)
+        + "</tbody></table></div>"
+        + limit_note
+    )
+
+
 def dashboard(message=""):
     stats = q_one(
         """
@@ -1040,6 +1188,7 @@ def dashboard(message=""):
     top_balance = q_all("SELECT * FROM wallets ORDER BY account_value DESC LIMIT 5")
     top_active = q_all("SELECT * FROM wallets ORDER BY active_positions DESC, account_value DESC LIMIT 5")
     top_positions = q_all("SELECT * FROM wallets ORDER BY margin_used DESC LIMIT 5")
+    recent_events = fetch_position_events(8)
     coins = q_all(
         """
         SELECT coin, SUM(position_value) value, COUNT(*) n
@@ -1098,6 +1247,10 @@ def dashboard(message=""):
         </div>
         <div class="bars">{coin_bars or '<div class="subtle">Sin posiciones activas.</div>'}</div>
       </div>
+    </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>Actividad reciente</h2>
+      {render_events_table(recent_events, compact=True)}
     </section>
     """
     return render_layout("Dashboard", body, "dashboard", message)
@@ -1200,6 +1353,32 @@ def wallets_page(query="", bias=""):
     </section>
     """
     return render_layout("Wallets", body, "wallets")
+
+
+def events_page():
+    events = fetch_position_events(200)
+    opens = sum(1 for event in events if event["event_type"] == "open")
+    closes = sum(1 for event in events if event["event_type"] == "close")
+    margin = sum(to_float(event["margin_used"]) for event in events)
+    body = f"""
+    <div class="topbar">
+      <div>
+        <h1>Actividad</h1>
+        <div class="subtle">Aperturas y cierres detectados durante los refresh de wallets guardadas</div>
+      </div>
+    </div>
+    <section class="grid metrics">
+      <div class="card"><div class="metric-label">Eventos visibles</div><div class="metric-value">{len(events)}</div></div>
+      <div class="card"><div class="metric-label">Aperturas</div><div class="metric-value">{opens}</div></div>
+      <div class="card"><div class="metric-label">Cierres</div><div class="metric-value">{closes}</div></div>
+      <div class="card"><div class="metric-label">Margen observado</div><div class="metric-value">{usd(margin)}</div></div>
+    </section>
+    <section class="card">
+      <h2>Eventos recientes</h2>
+      {render_events_table(events)}
+    </section>
+    """
+    return render_layout("Actividad", body, "events")
 
 
 def wallet_profile(address):
@@ -1464,6 +1643,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/wallets":
             query = urllib.parse.parse_qs(parsed.query)
             self.send_html(wallets_page(query.get("q", [""])[0], query.get("bias", [""])[0]))
+            return
+        if parsed.path == "/events":
+            self.send_html(events_page())
             return
         if parsed.path == "/trends":
             self.send_html(trends())
