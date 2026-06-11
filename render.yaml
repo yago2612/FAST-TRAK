@@ -24,3 +24,7 @@ services:
         value: "5"
       - key: POSITION_CLOSE_CONFIRMATIONS
         value: "2"
+      - key: MARK_WS_ENABLED
+        value: "1"
+      - key: PRICE_UI_REFRESH_MS
+        value: "200"

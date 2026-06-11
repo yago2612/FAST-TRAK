@@ -31,16 +31,22 @@ AUTO_REFRESH_INTERVAL = float(os.getenv("AUTO_REFRESH_INTERVAL", "5"))
 AUTO_REFRESH_BATCH = int(os.getenv("AUTO_REFRESH_BATCH", "5"))
 POSITION_EVENT_EPSILON = float(os.getenv("POSITION_EVENT_EPSILON", "0.00000001"))
 POSITION_CLOSE_CONFIRMATIONS = int(os.getenv("POSITION_CLOSE_CONFIRMATIONS", "2"))
+MARK_WS_ENABLED = os.getenv("MARK_WS_ENABLED", "1") == "1"
+PRICE_UI_REFRESH_MS = int(os.getenv("PRICE_UI_REFRESH_MS", "200"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 AUTO_STATUS = {
     "started": False,
+    "mark_started": False,
     "last_refresh": "",
     "last_discovery": "",
+    "last_mark": "",
     "last_error": "",
 }
+MARK_PRICE_CACHE = {"prices": {}, "updated_at": 0.0, "source": ""}
+MARK_PRICE_LOCK = threading.Lock()
 
 
 def now_iso():
@@ -306,11 +312,30 @@ def hyperliquid_info(payload):
         return json.loads(response.read().decode())
 
 
+def update_mark_price_cache(prices, source):
+    if not prices:
+        return
+    cleaned = {str(coin): to_float(price) for coin, price in prices.items() if to_float(price) > 0}
+    if not cleaned:
+        return
+    with MARK_PRICE_LOCK:
+        MARK_PRICE_CACHE["prices"].update(cleaned)
+        MARK_PRICE_CACHE["updated_at"] = time.time()
+        MARK_PRICE_CACHE["source"] = source
+    AUTO_STATUS["last_mark"] = f"{now_iso()} | {len(cleaned)} markets | {source}"
+
+
+def get_cached_mark_prices():
+    with MARK_PRICE_LOCK:
+        return dict(MARK_PRICE_CACHE["prices"]), MARK_PRICE_CACHE["updated_at"], MARK_PRICE_CACHE["source"]
+
+
 def fetch_mark_prices():
     try:
         data = hyperliquid_info({"type": "metaAndAssetCtxs"})
     except Exception:
-        return {}
+        prices, _, _ = get_cached_mark_prices()
+        return prices
     if not isinstance(data, list) or len(data) < 2:
         return {}
     meta, asset_contexts = data[0], data[1]
@@ -323,7 +348,52 @@ def fetch_mark_prices():
         mark_px = to_float(context.get("markPx"))
         if mark_px > 0:
             prices[str(coin)] = mark_px
+    update_mark_price_cache(prices, "rest")
     return prices
+
+
+def mark_price_worker():
+    if not MARK_WS_ENABLED:
+        return
+    AUTO_STATUS["mark_started"] = True
+    while True:
+        ws = None
+        try:
+            from websocket import WebSocketTimeoutException, create_connection
+
+            ws = create_connection(WS_URL, timeout=10)
+            ws.settimeout(10)
+            ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+            while True:
+                try:
+                    message = json.loads(ws.recv())
+                except WebSocketTimeoutException:
+                    continue
+                channel = message.get("channel")
+                data = message.get("data") or {}
+                if channel == "allMids" and isinstance(data, dict):
+                    mids = data.get("mids") if isinstance(data.get("mids"), dict) else data
+                    update_mark_price_cache(mids, "ws")
+        except Exception as exc:
+            AUTO_STATUS["last_error"] = f"mark ws: {exc}"
+            try:
+                fetch_mark_prices()
+            except Exception:
+                pass
+            time.sleep(3)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+
+def start_mark_price_worker():
+    if AUTO_STATUS["mark_started"]:
+        return
+    thread = threading.Thread(target=mark_price_worker, name="mark-price-worker", daemon=True)
+    thread.start()
 
 
 def discover_wallets_from_live_trades(coins_text="", seconds=None, max_candidates=None, min_notional=None):
@@ -1533,21 +1603,22 @@ def wallet_profile(address):
         (address,),
     )
     rows = []
+    profile_coins = sorted({str(pos["coin"]) for pos in positions})
     total_capital = sum(pos["capital_used"] for pos in positions)
     total_pnl = sum(pos["unrealized_pnl"] for pos in positions)
     for pos in positions:
         rows.append(
-            "<tr>"
+            f"<tr class='position-row' data-coin='{html.escape(pos['coin'])}' data-side='{html.escape(pos['side'])}' data-size='{abs(pos['size'])}' data-entry='{pos['entry_px']}' data-margin='{pos['capital_used']}'>"
             f"<td>{html.escape(pos['coin'])}</td>"
             f"<td>{badge(pos['side'])}</td>"
             f"<td>{abs(pos['size']):,.6f}</td>"
-            f"<td>{full_usd(pos['position_value'])}</td>"
+            f"<td class='pos-notional'>{full_usd(pos['position_value'])}</td>"
             f"<td>{full_usd(pos['capital_used'])}</td>"
             f"<td>{price(pos['entry_px'])}</td>"
-            f"<td>{price(pos['current_px'])}</td>"
-            f"<td>{signed_full_usd(pos['unrealized_pnl'])}</td>"
-            f"<td>{signed_pct(pos['roi_price'])}</td>"
-            f"<td>{signed_pct(pos['roi_capital'])}</td>"
+            f"<td class='pos-mark'>{price(pos['current_px'])}</td>"
+            f"<td class='pos-upnl'>{signed_full_usd(pos['unrealized_pnl'])}</td>"
+            f"<td class='pos-roi-price'>{signed_pct(pos['roi_price'])}</td>"
+            f"<td class='pos-roi-margin'>{signed_pct(pos['roi_capital'])}</td>"
             f"<td>{html.escape(pos['leverage'] or '-')}</td>"
             f"<td>{price_or_dash(pos['liquidation_px'])}</td>"
             "</tr>"
@@ -1566,7 +1637,7 @@ def wallet_profile(address):
       <div>
         <h1>{html.escape(wallet_name(wallet))}</h1>
         <div class="subtle">{html.escape(address)}</div>
-        <div class="subtle">Auto-refresh UI: 10s | Worker: {html.escape(AUTO_STATUS['last_refresh'] or 'esperando datos')}</div>
+        <div class="subtle">Precios live cada {PRICE_UI_REFRESH_MS}ms | Mark stream: <span id="mark-age">esperando</span> | Worker: {html.escape(AUTO_STATUS['last_refresh'] or 'esperando datos')}</div>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <form method="post" action="/wallet/{html.escape(address)}/refresh">
@@ -1632,12 +1703,69 @@ def wallet_profile(address):
       <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Balance</th><th>Posiciones</th><th>Activas</th></tr></thead><tbody>{snap_rows or '<tr><td colspan="4">Sin snapshots</td></tr>'}</tbody></table></div>
     </section>
     <script>
+      const watchedCoins = {json.dumps(profile_coins)};
+      const refreshMs = {PRICE_UI_REFRESH_MS};
+
+      function fmtPrice(value) {{
+        value = Number(value || 0);
+        const abs = Math.abs(value);
+        const decimals = abs >= 100 ? 2 : abs >= 1 ? 4 : abs >= 0.01 ? 6 : 8;
+        return "$" + value.toLocaleString(undefined, {{ minimumFractionDigits: decimals, maximumFractionDigits: decimals }});
+      }}
+
+      function fmtUsd(value) {{
+        value = Number(value || 0);
+        return "$" + Math.abs(value).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+      }}
+
+      function signedHtml(value, suffix) {{
+        value = Number(value || 0);
+        const cls = value > 0 ? "num-positive" : value < 0 ? "num-negative" : "num-neutral";
+        const sign = value > 0 ? "+" : "";
+        return `<span class="${{cls}}">${{sign}}${{suffix}}</span>`;
+      }}
+
+      async function refreshLiveMarks() {{
+        if (!watchedCoins.length) return;
+        try {{
+          const response = await fetch("/api/marks?coins=" + encodeURIComponent(watchedCoins.join(",")), {{ cache: "no-store" }});
+          if (!response.ok) return;
+          const payload = await response.json();
+          const prices = payload.prices || {{}};
+          const age = payload.updated_at ? Math.max(0, Date.now() / 1000 - payload.updated_at) : 0;
+          const ageEl = document.getElementById("mark-age");
+          if (ageEl) ageEl.textContent = `${{age.toFixed(2)}}s ${{payload.source || ""}}`;
+
+          document.querySelectorAll(".position-row").forEach((row) => {{
+            const coin = row.dataset.coin;
+            const mark = Number(prices[coin] || 0);
+            if (!mark) return;
+            const size = Number(row.dataset.size || 0);
+            const entry = Number(row.dataset.entry || 0);
+            const margin = Number(row.dataset.margin || 0);
+            const side = row.dataset.side;
+            const notional = size * mark;
+            const pnl = side === "Short" ? (entry - mark) * size : (mark - entry) * size;
+            const roiPrice = entry ? pnl / (entry * size) : 0;
+            const roiMargin = margin ? pnl / margin : 0;
+            row.querySelector(".pos-mark").textContent = fmtPrice(mark);
+            row.querySelector(".pos-notional").textContent = fmtUsd(notional);
+            row.querySelector(".pos-upnl").innerHTML = signedHtml(pnl, fmtUsd(pnl));
+            row.querySelector(".pos-roi-price").innerHTML = signedHtml(roiPrice, (Math.abs(roiPrice) * 100).toFixed(2) + "%");
+            row.querySelector(".pos-roi-margin").innerHTML = signedHtml(roiMargin, (Math.abs(roiMargin) * 100).toFixed(2) + "%");
+          }});
+        }} catch (error) {{}}
+      }}
+
+      refreshLiveMarks();
+      setInterval(refreshLiveMarks, Math.max(100, refreshMs));
+
       setInterval(function () {{
         var active = document.activeElement;
         if (!active || !['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {{
           window.location.reload();
         }}
-      }}, 10000);
+      }}, 60000);
     </script>
     """
     return render_layout("Wallet", body, "dashboard")
@@ -1743,6 +1871,15 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def send_json(self, payload, status=200):
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def redirect(self, location, headers=None):
         self.send_response(303)
         self.send_header("Location", location)
@@ -1765,6 +1902,18 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if not self.is_authed():
             self.redirect("/login")
+            return
+        if parsed.path == "/api/marks":
+            query = urllib.parse.parse_qs(parsed.query)
+            requested = {coin.strip().upper() for coin in query.get("coins", [""])[0].split(",") if coin.strip()}
+            prices, updated_at, source = get_cached_mark_prices()
+            if not prices or time.time() - updated_at > 3:
+                prices = fetch_mark_prices()
+                updated_at = time.time()
+                source = "rest"
+            if requested:
+                prices = {coin: prices.get(coin, 0) for coin in requested}
+            self.send_json({"prices": prices, "updated_at": updated_at, "source": source})
             return
         if parsed.path == "/":
             message = urllib.parse.parse_qs(parsed.query).get("message", [""])[0]
@@ -1842,6 +1991,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+    fetch_mark_prices()
+    start_mark_price_worker()
     start_auto_worker()
     port = int(os.getenv("PORT", "8000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), AppHandler)

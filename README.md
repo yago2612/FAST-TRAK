@@ -55,6 +55,7 @@ Mientras el servicio esta despierto, la app arranca un worker interno que:
 - recalcula balance, posiciones, precio actual derivado, margen usado, uPnL y ROI.
 - registra aperturas/cierres comparando contra un estado estable; los cierres requieren `POSITION_CLOSE_CONFIRMATIONS` lecturas consecutivas ausentes para evitar falsos positivos por respuestas incompletas.
 - usa `metaAndAssetCtxs` para tomar el `markPx` oficial de Hyperliquid; solo usa `positionValue / tamano` como fallback.
+- en el perfil de wallet, actualiza Mark px, Notional, uPnL y ROI con precios live desde WebSocket `allMids` cada `PRICE_UI_REFRESH_MS` milisegundos.
 
 En Render Free esto no es 24/7 garantizado porque el servicio puede dormirse, reiniciarse o perder SQLite local. Para monitoreo serio conviene Render pago + Postgres + worker separado.
 
@@ -76,6 +77,8 @@ AUTO_DISCOVERY_INTERVAL=180
 AUTO_REFRESH_INTERVAL=5
 AUTO_REFRESH_BATCH=5
 POSITION_CLOSE_CONFIRMATIONS=2
+MARK_WS_ENABLED=1
+PRICE_UI_REFRESH_MS=200
 HYPERLIQUID_INFO_URL=https://api.hyperliquid.xyz/info
 HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws
 HYPERLIQUID_SEED_WALLETS=0x...
