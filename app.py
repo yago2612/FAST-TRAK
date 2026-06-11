@@ -59,11 +59,66 @@ def usd(value):
     return f"${value:,.2f}"
 
 
-def pct(value):
+def full_usd(value):
     try:
-        return f"{float(value) * 100:.1f}%"
+        value = float(value or 0)
     except (TypeError, ValueError):
-        return "0.0%"
+        value = 0
+    return f"${value:,.2f}"
+
+
+def pct(value, decimals=1):
+    try:
+        return f"{float(value) * 100:.{decimals}f}%"
+    except (TypeError, ValueError):
+        return f"{0:.{decimals}f}%"
+
+
+def price(value):
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    absolute = abs(value)
+    if absolute >= 100:
+        decimals = 2
+    elif absolute >= 1:
+        decimals = 4
+    elif absolute >= 0.01:
+        decimals = 6
+    else:
+        decimals = 8
+    return f"${value:,.{decimals}f}"
+
+
+def signed_usd(value):
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    cls = "num-positive" if value > 0 else "num-negative" if value < 0 else "num-neutral"
+    return f'<span class="{cls}">{sign}{usd(abs(value))}</span>'
+
+
+def signed_full_usd(value):
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    cls = "num-positive" if value > 0 else "num-negative" if value < 0 else "num-neutral"
+    return f'<span class="{cls}">{sign}{full_usd(abs(value))}</span>'
+
+
+def signed_pct(value, decimals=2):
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    cls = "num-positive" if value > 0 else "num-negative" if value < 0 else "num-neutral"
+    return f'<span class="{cls}">{sign}{pct(abs(value), decimals)}</span>'
 
 
 def short_addr(address):
@@ -763,6 +818,9 @@ def render_layout(title, body, active="dashboard", message=""):
     .bear {{ color: var(--red); background: #fae8eb; }}
     .flat {{ color: var(--amber); background: #fff3d8; }}
     .neutral {{ color: var(--blue); background: #e9f0ff; }}
+    .num-positive {{ color: var(--green); font-weight: 850; }}
+    .num-negative {{ color: var(--red); font-weight: 850; }}
+    .num-neutral {{ color: var(--muted); font-weight: 750; }}
     .btn {{
       border: 0;
       background: #182033;
@@ -1086,7 +1144,7 @@ def wallet_profile(address):
         return render_layout("Wallet", "<h1>Wallet no encontrada</h1>", "dashboard")
     positions = q_all("SELECT * FROM positions WHERE wallet_address = ? ORDER BY position_value DESC", (address,))
     snapshots = q_all(
-        "SELECT * FROM wallet_snapshots WHERE wallet_address = ? ORDER BY id DESC LIMIT 12",
+        "SELECT * FROM wallet_snapshots WHERE wallet_address = ? ORDER BY id DESC LIMIT 3",
         (address,),
     )
     rows = []
@@ -1097,16 +1155,16 @@ def wallet_profile(address):
             "<tr>"
             f"<td>{html.escape(pos['coin'])}</td>"
             f"<td>{badge(pos['side'])}</td>"
-            f"<td>{pos['size']:,.6f}</td>"
-            f"<td>{usd(pos['position_value'])}</td>"
-            f"<td>{usd(pos['capital_used'])}</td>"
-            f"<td>{usd(pos['entry_px'])}</td>"
-            f"<td>{usd(pos['current_px'])}</td>"
-            f"<td>{usd(pos['unrealized_pnl'])}</td>"
-            f"<td>{pct(pos['roi_price'])}</td>"
-            f"<td>{pct(pos['roi_capital'])}</td>"
+            f"<td>{abs(pos['size']):,.6f}</td>"
+            f"<td>{full_usd(pos['position_value'])}</td>"
+            f"<td>{full_usd(pos['capital_used'])}</td>"
+            f"<td>{price(pos['entry_px'])}</td>"
+            f"<td>{price(pos['current_px'])}</td>"
+            f"<td>{signed_full_usd(pos['unrealized_pnl'])}</td>"
+            f"<td>{signed_pct(pos['roi_price'])}</td>"
+            f"<td>{signed_pct(pos['roi_capital'])}</td>"
             f"<td>{html.escape(pos['leverage'] or '-')}</td>"
-            f"<td>{usd(pos['liquidation_px'])}</td>"
+            f"<td>{price(pos['liquidation_px'])}</td>"
             "</tr>"
         )
     snap_rows = "".join(
@@ -1147,30 +1205,28 @@ def wallet_profile(address):
     <section class="grid metrics">
       <div class="card"><div class="metric-label">Exposicion neta</div><div class="metric-value">{usd(wallet['net_exposure'])}</div></div>
       <div class="card"><div class="metric-label">Sesgo</div><div class="metric-value">{badge(wallet['direction_bias'])}</div></div>
-      <div class="card"><div class="metric-label">ROI sobre capital</div><div class="metric-value">{pct(total_pnl / total_capital if total_capital else 0)}</div></div>
+      <div class="card"><div class="metric-label">ROI sobre capital</div><div class="metric-value">{signed_pct(total_pnl / total_capital if total_capital else 0)}</div></div>
       <div class="card"><div class="metric-label">Posiciones activas</div><div class="metric-value">{int(wallet['active_positions'])}</div></div>
     </section>
-    <section class="grid two">
-      <div class="card">
-        <h2>Detalle</h2>
-        <table><tbody>
-          <tr><th>Withdrawable</th><td>{usd(wallet['withdrawable'])}</td></tr>
-          <tr><th>Margen usado</th><td>{usd(wallet['margin_used'])}</td></tr>
-          <tr><th>Exposicion long</th><td>{usd(wallet['long_value'])}</td></tr>
-          <tr><th>Exposicion short</th><td>{usd(wallet['short_value'])}</td></tr>
-          <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
-          <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
-          <tr><th>Ultima lectura</th><td>{html.escape(wallet['last_seen'])}</td></tr>
-        </tbody></table>
-      </div>
-      <div class="card">
-        <h2>Snapshots</h2>
-        <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Balance</th><th>Posiciones</th><th>Activas</th></tr></thead><tbody>{snap_rows or '<tr><td colspan="4">Sin snapshots</td></tr>'}</tbody></table></div>
-      </div>
+    <section class="card">
+      <h2>Detalle</h2>
+      <table><tbody>
+        <tr><th>Withdrawable</th><td>{usd(wallet['withdrawable'])}</td></tr>
+        <tr><th>Margen usado</th><td>{usd(wallet['margin_used'])}</td></tr>
+        <tr><th>Exposicion long</th><td>{usd(wallet['long_value'])}</td></tr>
+        <tr><th>Exposicion short</th><td>{usd(wallet['short_value'])}</td></tr>
+        <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
+        <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
+        <tr><th>Ultima lectura</th><td>{html.escape(wallet['last_seen'])}</td></tr>
+      </tbody></table>
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Posiciones por moneda</h2>
-      <div class="table-wrap"><table><thead><tr><th>Coin</th><th>Lado</th><th>Tamano</th><th>Valor apal.</th><th>Capital real</th><th>Entrada</th><th>Actual</th><th>uPnL</th><th>ROI precio</th><th>ROI capital</th><th>Lev</th><th>Liq.</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="12">Sin posiciones activas</td></tr>'}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Coin</th><th>Lado</th><th>Tamano abs.</th><th>Valor apal.</th><th>Capital real</th><th>Entrada</th><th>Actual</th><th>uPnL</th><th>ROI precio</th><th>ROI capital</th><th>Lev</th><th>Liq.</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="12">Sin posiciones activas</td></tr>'}</tbody></table></div>
+    </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>Snapshots</h2>
+      <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Balance</th><th>Posiciones</th><th>Activas</th></tr></thead><tbody>{snap_rows or '<tr><td colspan="4">Sin snapshots</td></tr>'}</tbody></table></div>
     </section>
     <script>
       setInterval(function () {{
