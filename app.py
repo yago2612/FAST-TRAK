@@ -1189,6 +1189,49 @@ def derived_fill(fill, size, fee, builder_fee, closed_pnl):
     }
 
 
+def fill_episode_steps(fill):
+    direction = str(fill["dir"] or "")
+    size = abs(to_float(fill["size"]))
+    if size <= POSITION_EVENT_EPSILON:
+        return []
+
+    before, after = fill_reversal_sides(direction)
+    if before and after:
+        start_abs = abs(to_float(fill["start_position"]))
+        close_size = min(start_abs, size)
+        open_size = max(0.0, size - close_size)
+        fee = to_float(fill["fee"])
+        builder_fee = to_float(fill["builder_fee"])
+        steps = []
+        if close_size > POSITION_EVENT_EPSILON:
+            close_share = close_size / size
+            steps.append((
+                "close",
+                before,
+                derived_fill(fill, close_size, fee * close_share, builder_fee * close_share, fill["closed_pnl"]),
+                True,
+            ))
+        if open_size > POSITION_EVENT_EPSILON:
+            open_share = open_size / size
+            steps.append((
+                "open",
+                after,
+                derived_fill(fill, open_size, fee * open_share, builder_fee * open_share, 0.0),
+                False,
+            ))
+        return steps
+
+    side = fill_position_side(direction)
+    action = fill_action(direction)
+    if not side or not action:
+        return []
+    closes_position = False
+    if action == "close":
+        remaining = abs(to_float(fill["start_position"])) - size
+        closes_position = remaining <= POSITION_EVENT_EPSILON
+    return [(action, side, fill, closes_position)]
+
+
 def new_episode(address, coin, side, opened_at_ms=None):
     return {
         "wallet_address": address,
@@ -1279,29 +1322,25 @@ def rebuild_trade_episodes(address):
         ).fetchall()
         active = {}
         for fill in fills:
-            side = fill_position_side(fill["dir"])
-            action = fill_action(fill["dir"])
-            if not side or not action:
-                continue
-            key = (fill["coin"], side)
-            if action == "open":
+            for action, side, episode_fill, closes_position in fill_episode_steps(fill):
+                key = (fill["coin"], side)
+                if action == "open":
+                    episode = active.get(key)
+                    if not episode:
+                        episode = new_episode(address, fill["coin"], side, int(fill["time_ms"]))
+                        active[key] = episode
+                    add_fill_to_episode(episode, episode_fill, action)
+                    continue
+
                 episode = active.get(key)
                 if not episode:
-                    episode = new_episode(address, fill["coin"], side, int(fill["time_ms"]))
+                    episode = new_episode(address, fill["coin"], side, None)
                     active[key] = episode
-                add_fill_to_episode(episode, fill, action)
-                continue
-
-            episode = active.get(key)
-            if not episode:
-                episode = new_episode(address, fill["coin"], side, None)
-                active[key] = episode
-            add_fill_to_episode(episode, fill, action)
-            remaining = abs(to_float(fill["start_position"])) - abs(to_float(fill["size"]))
-            if remaining <= POSITION_EVENT_EPSILON:
-                episode["status"] = "closed"
-                persist_episode(conn, episode, rebuilt_at)
-                active.pop(key, None)
+                add_fill_to_episode(episode, episode_fill, action)
+                if closes_position:
+                    episode["status"] = "closed"
+                    persist_episode(conn, episode, rebuilt_at)
+                    active.pop(key, None)
 
         for episode in active.values():
             persist_episode(conn, episode, rebuilt_at)
@@ -1928,6 +1967,14 @@ def wallet_trade_stats(address):
         """,
         (address,),
     )
+    open_rows = q_all(
+        """
+        SELECT * FROM trade_episodes
+        WHERE wallet_address = ? AND status = 'open'
+        ORDER BY COALESCE(opened_at_ms, 0) DESC, id DESC
+        """,
+        (address,),
+    )
     def bucket(start_ms=None):
         selected = [row for row in rows if start_ms is None or int(row["closed_at_ms"] or 0) >= start_ms]
         wins = sum(1 for row in selected if to_float(row["net_pnl"]) > 0)
@@ -1950,6 +1997,7 @@ def wallet_trade_stats(address):
         "month": bucket(month_start),
         "all": bucket(None),
         "recent": rows[:25],
+        "open": open_rows[:25],
     }
 
 
@@ -1995,6 +2043,36 @@ def render_trade_episodes_table(rows):
         '<th>Cierre</th><th>Coin</th><th>Lado</th><th>Tamano cerrado</th>'
         '<th>Avg entry</th><th>Avg close</th><th>PnL bruto</th><th>Fees netas</th>'
         '<th>PnL neto</th><th>Fills</th><th>Maker/Taker</th>'
+        '</tr></thead><tbody>'
+        + "".join(trs)
+        + "</tbody></table></div>"
+    )
+
+
+def render_open_trade_episodes_table(rows):
+    if not rows:
+        return '<div class="subtle">No hay trades abiertos reconstruidos desde fills recientes. Usa la tabla de posiciones como fuente actual.</div>'
+    trs = []
+    for row in rows:
+        opened = ms_to_local_text(row["opened_at_ms"]) if row["opened_at_ms"] else "Antes del historial disponible"
+        remaining = max(0.0, to_float(row["open_size"]) - to_float(row["close_size"]))
+        trs.append(
+            "<tr>"
+            f"<td>{opened}</td>"
+            f"<td>{html.escape(row['coin'])}</td>"
+            f"<td>{badge(row['side'])}</td>"
+            f"<td>{row['open_size']:,.6f}</td>"
+            f"<td>{remaining:,.6f}</td>"
+            f"<td>{price_or_dash(row['avg_entry_px'])}</td>"
+            f"<td>{full_usd(row['fees'])}</td>"
+            f"<td>{int(row['fill_count'])}</td>"
+            f"<td>{int(row['maker_fills'])}/{int(row['taker_fills'])}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table><thead><tr>'
+        '<th>Apertura</th><th>Coin</th><th>Lado</th><th>Tamano abierto</th>'
+        '<th>Tamano vivo estimado</th><th>Avg entry</th><th>Fees netas</th><th>Fills</th><th>Maker/Taker</th>'
         '</tr></thead><tbody>'
         + "".join(trs)
         + "</tbody></table></div>"
@@ -2335,6 +2413,11 @@ def wallet_profile(address, message=""):
         <div><div class="metric-label">Fees netas total</div><div class="metric-value">{usd(trade_stats['all']['fees'])}</div></div>
         <div><div class="metric-label">Profit factor</div><div class="metric-value">{trade_stats['all']['profit_factor']:.2f}</div></div>
       </div>
+    </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>Trades abiertos desde fills</h2>
+      <div class="subtle">Solo aparecen si la apertura o escalados estan dentro de los fills recientes disponibles. Las posiciones actuales completas estan abajo.</div>
+      {render_open_trade_episodes_table(trade_stats['open'])}
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Trades cerrados reales</h2>
