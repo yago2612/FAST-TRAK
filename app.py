@@ -35,8 +35,8 @@ MARK_WS_ENABLED = os.getenv("MARK_WS_ENABLED", "1") == "1"
 PRICE_UI_REFRESH_MS = int(os.getenv("PRICE_UI_REFRESH_MS", "200"))
 FILL_SYNC_ENABLED = os.getenv("FILL_SYNC_ENABLED", "1") == "1"
 FILL_SYNC_INTERVAL = int(os.getenv("FILL_SYNC_INTERVAL", "60"))
-FILL_SYNC_BATCH = int(os.getenv("FILL_SYNC_BATCH", "3"))
-FILL_LOOKBACK_DAYS = int(os.getenv("FILL_LOOKBACK_DAYS", "14"))
+FILL_SYNC_BATCH = int(os.getenv("FILL_SYNC_BATCH", "10"))
+FILL_SYNC_TOP_N = int(os.getenv("FILL_SYNC_TOP_N", "10"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
@@ -321,6 +321,23 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_fills_wallet_time
                 ON fills(wallet_address, time_ms);
+
+            DELETE FROM fills
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM fills
+                GROUP BY
+                    wallet_address,
+                    COALESCE(
+                        NULLIF(tid, ''),
+                        COALESCE(hash, '') || '|' || COALESCE(oid, '') || '|' ||
+                        time_ms || '|' || coin || '|' || dir || '|' || px || '|' || size
+                    )
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_wallet_tid_unique
+                ON fills(wallet_address, tid)
+                WHERE tid IS NOT NULL AND tid != '';
 
             CREATE INDEX IF NOT EXISTS idx_trade_episodes_wallet_closed
                 ON trade_episodes(wallet_address, status, closed_at_ms);
@@ -1073,6 +1090,15 @@ def fetch_user_fills_by_time(address, start_ms, end_ms=None):
     return data if isinstance(data, list) else []
 
 
+def fetch_user_fills(address):
+    data = hyperliquid_info({
+        "type": "userFills",
+        "user": address,
+        "aggregateByTime": False,
+    })
+    return data if isinstance(data, list) else []
+
+
 def save_fills(conn, address, fills):
     synced_at = now_iso()
     inserted = 0
@@ -1130,6 +1156,29 @@ def fill_action(direction):
     if direction.startswith("Close"):
         return "close"
     return ""
+
+
+def fill_reversal_sides(direction):
+    direction = str(direction or "")
+    if ">" not in direction:
+        return "", ""
+    before, after = [part.strip() for part in direction.split(">", 1)]
+    if before in ("Long", "Short") and after in ("Long", "Short"):
+        return before, after
+    return "", ""
+
+
+def derived_fill(fill, size, fee, builder_fee, closed_pnl):
+    return {
+        "size": size,
+        "px": fill["px"],
+        "fee": fee,
+        "builder_fee": builder_fee,
+        "crossed": fill["crossed"],
+        "time_ms": fill["time_ms"],
+        "closed_pnl": closed_pnl,
+        "start_position": fill["start_position"],
+    }
 
 
 def new_episode(address, coin, side, opened_at_ms=None):
@@ -1250,35 +1299,42 @@ def rebuild_trade_episodes(address):
             persist_episode(conn, episode, rebuilt_at)
 
 
-def sync_wallet_fills(address, lookback_days=None):
+def sync_wallet_fills(address):
     address = address.lower()
     end_ms = now_ms()
     attempted_at = now_iso()
-    lookback_ms = int((lookback_days or FILL_LOOKBACK_DAYS) * 24 * 60 * 60 * 1000)
     with connect_db() as conn:
         state = conn.execute(
             "SELECT last_time_ms FROM fill_sync_state WHERE wallet_address = ?",
             (address,),
         ).fetchone()
-        start_ms = int(state["last_time_ms"]) + 1 if state else end_ms - lookback_ms
+        start_ms = int(state["last_time_ms"]) + 1 if state else 0
 
     total_inserted = 0
     total_seen = 0
     max_seen = start_ms
     cursor_ms = start_ms
     try:
-        while cursor_ms <= end_ms:
-            fills = fetch_user_fills_by_time(address, cursor_ms, end_ms)
-            if not fills:
-                break
-            total_seen += len(fills)
+        if not state:
+            fills = fetch_user_fills(address)
+            total_seen = len(fills)
             with connect_db() as conn:
                 inserted, batch_max = save_fills(conn, address, fills)
                 total_inserted += inserted
                 max_seen = max(max_seen, batch_max)
-            if len(fills) < 2000 or batch_max <= cursor_ms:
-                break
-            cursor_ms = batch_max + 1
+        else:
+            while cursor_ms <= end_ms:
+                fills = fetch_user_fills_by_time(address, cursor_ms, end_ms)
+                if not fills:
+                    break
+                total_seen += len(fills)
+                with connect_db() as conn:
+                    inserted, batch_max = save_fills(conn, address, fills)
+                    total_inserted += inserted
+                    max_seen = max(max_seen, batch_max)
+                if len(fills) < 2000 or batch_max <= cursor_ms:
+                    break
+                cursor_ms = batch_max + 1
     except Exception as exc:
         with connect_db() as conn:
             conn.execute(
@@ -1327,15 +1383,24 @@ def sync_wallet_fills(address, lookback_days=None):
 
 def sync_saved_wallet_fills(batch_size=None):
     batch_size = max(1, int(batch_size or FILL_SYNC_BATCH))
+    top_n = max(batch_size, int(FILL_SYNC_TOP_N))
     wallets = q_all(
         """
-        SELECT w.address
-        FROM wallets w
-        LEFT JOIN fill_sync_state s ON s.wallet_address = w.address
-        ORDER BY COALESCE(s.synced_at, '') ASC, w.last_seen DESC
+        WITH top_wallets AS (
+            SELECT address, account_value, margin_used, last_seen
+            FROM wallets
+            ORDER BY (account_value + margin_used) DESC
+            LIMIT ?
+        )
+        SELECT t.address
+        FROM top_wallets t
+        LEFT JOIN fill_sync_state s ON s.wallet_address = t.address
+        ORDER BY
+            COALESCE(NULLIF(s.last_attempt_at, ''), NULLIF(s.synced_at, ''), '') ASC,
+            (t.account_value + t.margin_used) DESC
         LIMIT ?
         """,
-        (batch_size,),
+        (top_n, batch_size),
     )
     synced = 0
     errors = []
@@ -1403,7 +1468,7 @@ def auto_worker():
 
             if FILL_SYNC_ENABLED and time.monotonic() >= next_fill_sync:
                 synced, fill_errors = sync_saved_wallet_fills()
-                AUTO_STATUS["last_fill_sync"] = f"{now_iso()} | {synced} wallets"
+                AUTO_STATUS["last_fill_sync"] = f"{now_iso()} | {synced}/{FILL_SYNC_TOP_N} top wallets"
                 if fill_errors:
                     AUTO_STATUS["last_error"] = "; ".join(fill_errors[-3:])
                 next_fill_sync = time.monotonic() + max(10, FILL_SYNC_INTERVAL)
@@ -2038,7 +2103,7 @@ def events_page():
     <div class="topbar">
       <div>
         <h1>Actividad</h1>
-        <div class="subtle">Aperturas y cierres detectados durante los refresh de wallets guardadas</div>
+        <div class="subtle">Eventos inferidos por cambios de posiciones durante refresh; winrate y PnL cerrado usan fills reales.</div>
       </div>
     </div>
     <section class="grid metrics">

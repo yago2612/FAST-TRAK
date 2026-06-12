@@ -33,6 +33,6 @@ services:
       - key: FILL_SYNC_INTERVAL
         value: "60"
       - key: FILL_SYNC_BATCH
-        value: "3"
-      - key: FILL_LOOKBACK_DAYS
-        value: "14"
+        value: "10"
+      - key: FILL_SYNC_TOP_N
+        value: "10"

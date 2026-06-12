@@ -56,7 +56,8 @@ Mientras el servicio esta despierto, la app arranca un worker interno que:
 - registra aperturas/cierres comparando contra un estado estable; los cierres requieren `POSITION_CLOSE_CONFIRMATIONS` lecturas consecutivas ausentes para evitar falsos positivos por respuestas incompletas.
 - usa `metaAndAssetCtxs` para tomar el `markPx` oficial de Hyperliquid; solo usa `positionValue / tamano` como fallback.
 - en el perfil de wallet, actualiza Mark px, Notional, uPnL y ROI con precios live desde WebSocket `allMids` cada `PRICE_UI_REFRESH_MS` milisegundos.
-- sincroniza fills reales con `userFillsByTime` para reconstruir trades cerrados, winrate, PnL neto y fees reales.
+- sincroniza fills reales para reconstruir trades cerrados, winrate, PnL neto y fees reales. El primer sync toma los fills mas recientes con `userFills`; luego usa `userFillsByTime` incremental desde el ultimo fill sincronizado.
+- por defecto, el sync automatico de fills se limita al top 10 por capital real aproximado (`account_value + margin_used`) para evitar sobrecargar el servicio.
 
 En Render Free esto no es 24/7 garantizado porque el servicio puede dormirse, reiniciarse o perder SQLite local. Para monitoreo serio conviene Render pago + Postgres + worker separado.
 
@@ -82,8 +83,8 @@ MARK_WS_ENABLED=1
 PRICE_UI_REFRESH_MS=200
 FILL_SYNC_ENABLED=1
 FILL_SYNC_INTERVAL=60
-FILL_SYNC_BATCH=3
-FILL_LOOKBACK_DAYS=14
+FILL_SYNC_BATCH=10
+FILL_SYNC_TOP_N=10
 HYPERLIQUID_INFO_URL=https://api.hyperliquid.xyz/info
 HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws
 HYPERLIQUID_SEED_WALLETS=0x...
