@@ -291,7 +291,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS fill_sync_state (
                 wallet_address TEXT PRIMARY KEY,
                 last_time_ms INTEGER NOT NULL DEFAULT 0,
-                synced_at TEXT NOT NULL
+                synced_at TEXT NOT NULL,
+                last_attempt_at TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                last_inserted INTEGER NOT NULL DEFAULT 0,
+                last_seen_fills INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS trade_episodes (
@@ -328,6 +332,10 @@ def init_db():
         ensure_column(conn, "positions", "roi_price", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "positions", "roi_capital", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "positions", "leverage_value", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "fill_sync_state", "last_attempt_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "fill_sync_state", "last_error", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "fill_sync_state", "last_inserted", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "fill_sync_state", "last_seen_fills", "INTEGER NOT NULL DEFAULT 0")
 
 
 def ensure_column(conn, table, column, definition):
@@ -1245,6 +1253,7 @@ def rebuild_trade_episodes(address):
 def sync_wallet_fills(address, lookback_days=None):
     address = address.lower()
     end_ms = now_ms()
+    attempted_at = now_iso()
     lookback_ms = int((lookback_days or FILL_LOOKBACK_DAYS) * 24 * 60 * 60 * 1000)
     with connect_db() as conn:
         state = conn.execute(
@@ -1254,30 +1263,63 @@ def sync_wallet_fills(address, lookback_days=None):
         start_ms = int(state["last_time_ms"]) + 1 if state else end_ms - lookback_ms
 
     total_inserted = 0
+    total_seen = 0
     max_seen = start_ms
     cursor_ms = start_ms
-    while cursor_ms <= end_ms:
-        fills = fetch_user_fills_by_time(address, cursor_ms, end_ms)
-        if not fills:
-            break
+    try:
+        while cursor_ms <= end_ms:
+            fills = fetch_user_fills_by_time(address, cursor_ms, end_ms)
+            if not fills:
+                break
+            total_seen += len(fills)
+            with connect_db() as conn:
+                inserted, batch_max = save_fills(conn, address, fills)
+                total_inserted += inserted
+                max_seen = max(max_seen, batch_max)
+            if len(fills) < 2000 or batch_max <= cursor_ms:
+                break
+            cursor_ms = batch_max + 1
+    except Exception as exc:
         with connect_db() as conn:
-            inserted, batch_max = save_fills(conn, address, fills)
-            total_inserted += inserted
-            max_seen = max(max_seen, batch_max)
-        if len(fills) < 2000 or batch_max <= cursor_ms:
-            break
-        cursor_ms = batch_max + 1
+            conn.execute(
+                """
+                INSERT INTO fill_sync_state (
+                    wallet_address, last_time_ms, synced_at, last_attempt_at,
+                    last_error, last_inserted, last_seen_fills
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(wallet_address) DO UPDATE SET
+                    last_attempt_at=excluded.last_attempt_at,
+                    last_error=excluded.last_error,
+                    last_inserted=0,
+                    last_seen_fills=excluded.last_seen_fills
+                """,
+                (
+                    address,
+                    int(state["last_time_ms"]) if state else 0,
+                    state["synced_at"] if state else "",
+                    attempted_at,
+                    str(exc)[:400],
+                    total_seen,
+                ),
+            )
+        raise
 
     with connect_db() as conn:
         conn.execute(
             """
-            INSERT INTO fill_sync_state (wallet_address, last_time_ms, synced_at)
-            VALUES (?, ?, ?)
+            INSERT INTO fill_sync_state (
+                wallet_address, last_time_ms, synced_at, last_attempt_at,
+                last_error, last_inserted, last_seen_fills
+            ) VALUES (?, ?, ?, ?, '', ?, ?)
             ON CONFLICT(wallet_address) DO UPDATE SET
                 last_time_ms=excluded.last_time_ms,
-                synced_at=excluded.synced_at
+                synced_at=excluded.synced_at,
+                last_attempt_at=excluded.last_attempt_at,
+                last_error='',
+                last_inserted=excluded.last_inserted,
+                last_seen_fills=excluded.last_seen_fills
             """,
-            (address, max(max_seen, end_ms - 1), now_iso()),
+            (address, max(max_seen, end_ms - 1), now_iso(), attempted_at, total_inserted, total_seen),
         )
     rebuild_trade_episodes(address)
     return total_inserted
@@ -1755,6 +1797,23 @@ def wallet_trade_stats(address):
     }
 
 
+def fill_sync_status(fill_state):
+    if not fill_state:
+        return "Nunca"
+    last_error = fill_state["last_error"] if "last_error" in fill_state.keys() else ""
+    last_attempt = fill_state["last_attempt_at"] if "last_attempt_at" in fill_state.keys() else ""
+    synced_at = fill_state["synced_at"] or ""
+    if last_error:
+        return f"Fallo {last_attempt or '-'}: {last_error}"
+    if synced_at:
+        inserted = int(fill_state["last_inserted"] or 0) if "last_inserted" in fill_state.keys() else 0
+        seen = int(fill_state["last_seen_fills"] or 0) if "last_seen_fills" in fill_state.keys() else 0
+        return f"{synced_at} | {inserted} nuevos | {seen} vistos"
+    if last_attempt:
+        return f"Intento {last_attempt}, sin sync OK"
+    return "Nunca"
+
+
 def render_trade_episodes_table(rows):
     if not rows:
         return '<div class="subtle">Aun no hay trades cerrados reconstruidos desde fills.</div>'
@@ -1996,7 +2055,7 @@ def events_page():
     return render_layout("Actividad", body, "events")
 
 
-def wallet_profile(address):
+def wallet_profile(address, message=""):
     address = address.lower()
     wallet = q_one("SELECT * FROM wallets WHERE address = ?", (address,))
     if not wallet:
@@ -2094,7 +2153,7 @@ def wallet_profile(address):
         <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
         <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
         <tr><th>Ultima lectura</th><td>{html.escape(wallet['last_seen'])}</td></tr>
-        <tr><th>Ultimo sync fills</th><td>{html.escape(fill_state['synced_at'] if fill_state else 'Nunca')}</td></tr>
+        <tr><th>Ultimo sync fills</th><td>{html.escape(fill_sync_status(fill_state))}</td></tr>
       </tbody></table>
     </section>
     <section class="card" style="margin-top:16px;">
@@ -2207,7 +2266,7 @@ def wallet_profile(address):
       }}, 60000);
     </script>
     """
-    return render_layout("Wallet", body, "dashboard")
+    return render_layout("Wallet", body, "dashboard", message)
 
 
 def trend_sentence(wallet):
@@ -2370,7 +2429,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/wallet/"):
             address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1])
-            self.send_html(wallet_profile(address))
+            message = urllib.parse.parse_qs(parsed.query).get("message", [""])[0]
+            self.send_html(wallet_profile(address, message))
             return
         self.send_html(render_layout("404", "<h1>404</h1>", "dashboard"), 404)
 
@@ -2410,10 +2470,11 @@ class AppHandler(BaseHTTPRequestHandler):
             address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/sync-fills", 1)[0]).lower()
             if ADDRESS_RE.match(address):
                 try:
-                    sync_wallet_fills(address)
-                except Exception:
-                    pass
-                self.redirect(f"/wallet/{address}")
+                    inserted = sync_wallet_fills(address)
+                    msg = f"Sync fills OK: {inserted} fills nuevos."
+                except Exception as exc:
+                    msg = f"Sync fills fallo: {str(exc)[:180]}"
+                self.redirect(f"/wallet/{address}?message=" + urllib.parse.quote(msg))
             else:
                 self.redirect("/wallets")
             return
