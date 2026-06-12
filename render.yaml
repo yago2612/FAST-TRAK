@@ -28,3 +28,11 @@ services:
         value: "1"
       - key: PRICE_UI_REFRESH_MS
         value: "200"
+      - key: FILL_SYNC_ENABLED
+        value: "1"
+      - key: FILL_SYNC_INTERVAL
+        value: "60"
+      - key: FILL_SYNC_BATCH
+        value: "3"
+      - key: FILL_LOOKBACK_DAYS
+        value: "14"

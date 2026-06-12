@@ -33,6 +33,10 @@ POSITION_EVENT_EPSILON = float(os.getenv("POSITION_EVENT_EPSILON", "0.00000001")
 POSITION_CLOSE_CONFIRMATIONS = int(os.getenv("POSITION_CLOSE_CONFIRMATIONS", "2"))
 MARK_WS_ENABLED = os.getenv("MARK_WS_ENABLED", "1") == "1"
 PRICE_UI_REFRESH_MS = int(os.getenv("PRICE_UI_REFRESH_MS", "200"))
+FILL_SYNC_ENABLED = os.getenv("FILL_SYNC_ENABLED", "1") == "1"
+FILL_SYNC_INTERVAL = int(os.getenv("FILL_SYNC_INTERVAL", "60"))
+FILL_SYNC_BATCH = int(os.getenv("FILL_SYNC_BATCH", "3"))
+FILL_LOOKBACK_DAYS = int(os.getenv("FILL_LOOKBACK_DAYS", "14"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-for-production")
@@ -43,6 +47,7 @@ AUTO_STATUS = {
     "last_refresh": "",
     "last_discovery": "",
     "last_mark": "",
+    "last_fill_sync": "",
     "last_error": "",
 }
 MARK_PRICE_CACHE = {"prices": {}, "updated_at": 0.0, "source": ""}
@@ -260,6 +265,61 @@ def init_db():
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(wallet_address, coin, side)
             );
+
+            CREATE TABLE IF NOT EXISTS fills (
+                fill_id TEXT PRIMARY KEY,
+                wallet_address TEXT NOT NULL,
+                tid TEXT,
+                oid TEXT,
+                coin TEXT NOT NULL,
+                dir TEXT NOT NULL,
+                side TEXT,
+                px REAL NOT NULL DEFAULT 0,
+                size REAL NOT NULL DEFAULT 0,
+                start_position REAL NOT NULL DEFAULT 0,
+                closed_pnl REAL NOT NULL DEFAULT 0,
+                fee REAL NOT NULL DEFAULT 0,
+                builder_fee REAL NOT NULL DEFAULT 0,
+                fee_token TEXT,
+                crossed INTEGER NOT NULL DEFAULT 0,
+                hash TEXT,
+                time_ms INTEGER NOT NULL,
+                raw_json TEXT NOT NULL,
+                synced_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fill_sync_state (
+                wallet_address TEXT PRIMARY KEY,
+                last_time_ms INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trade_episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                opened_at_ms INTEGER,
+                closed_at_ms INTEGER,
+                open_size REAL NOT NULL DEFAULT 0,
+                close_size REAL NOT NULL DEFAULT 0,
+                avg_entry_px REAL NOT NULL DEFAULT 0,
+                avg_close_px REAL NOT NULL DEFAULT 0,
+                gross_pnl REAL NOT NULL DEFAULT 0,
+                fees REAL NOT NULL DEFAULT 0,
+                net_pnl REAL NOT NULL DEFAULT 0,
+                fill_count INTEGER NOT NULL DEFAULT 0,
+                maker_fills INTEGER NOT NULL DEFAULT 0,
+                taker_fills INTEGER NOT NULL DEFAULT 0,
+                rebuilt_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fills_wallet_time
+                ON fills(wallet_address, time_ms);
+
+            CREATE INDEX IF NOT EXISTS idx_trade_episodes_wallet_closed
+                ON trade_episodes(wallet_address, status, closed_at_ms);
             """
         )
         ensure_column(conn, "wallets", "alias", "TEXT NOT NULL DEFAULT ''")
@@ -977,6 +1037,276 @@ def q_all(query, params=()):
         return conn.execute(query, params).fetchall()
 
 
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def fill_id(fill, address=""):
+    tid = fill.get("tid")
+    prefix = address.lower() + ":" if address else ""
+    if tid not in (None, ""):
+        return prefix + str(tid)
+    return prefix + "|".join(
+        str(fill.get(key, ""))
+        for key in ("hash", "oid", "time", "coin", "dir", "px", "sz")
+    )
+
+
+def fetch_user_fills_by_time(address, start_ms, end_ms=None):
+    payload = {
+        "type": "userFillsByTime",
+        "user": address,
+        "startTime": int(start_ms),
+        "aggregateByTime": False,
+    }
+    if end_ms:
+        payload["endTime"] = int(end_ms)
+    data = hyperliquid_info(payload)
+    return data if isinstance(data, list) else []
+
+
+def save_fills(conn, address, fills):
+    synced_at = now_iso()
+    inserted = 0
+    max_time = 0
+    for fill in fills:
+        time_ms = int(to_float(fill.get("time"), 0))
+        max_time = max(max_time, time_ms)
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO fills (
+                fill_id, wallet_address, tid, oid, coin, dir, side, px, size,
+                start_position, closed_pnl, fee, builder_fee, fee_token,
+                crossed, hash, time_ms, raw_json, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fill_id(fill, address),
+                address,
+                str(fill.get("tid", "")),
+                str(fill.get("oid", "")),
+                str(fill.get("coin", "")),
+                str(fill.get("dir", "")),
+                str(fill.get("side", "")),
+                to_float(fill.get("px")),
+                abs(to_float(fill.get("sz"))),
+                to_float(fill.get("startPosition")),
+                to_float(fill.get("closedPnl")),
+                to_float(fill.get("fee")),
+                to_float(fill.get("builderFee")),
+                str(fill.get("feeToken", "")),
+                1 if fill.get("crossed") else 0,
+                str(fill.get("hash", "")),
+                time_ms,
+                json.dumps(fill, separators=(",", ":")),
+                synced_at,
+            ),
+        )
+        inserted += cursor.rowcount
+    return inserted, max_time
+
+
+def fill_position_side(direction):
+    direction = str(direction or "")
+    if "Long" in direction:
+        return "Long"
+    if "Short" in direction:
+        return "Short"
+    return ""
+
+
+def fill_action(direction):
+    direction = str(direction or "")
+    if direction.startswith("Open"):
+        return "open"
+    if direction.startswith("Close"):
+        return "close"
+    return ""
+
+
+def new_episode(address, coin, side, opened_at_ms=None):
+    return {
+        "wallet_address": address,
+        "coin": coin,
+        "side": side,
+        "status": "open",
+        "opened_at_ms": opened_at_ms,
+        "closed_at_ms": None,
+        "open_size": 0.0,
+        "open_notional": 0.0,
+        "close_size": 0.0,
+        "close_notional": 0.0,
+        "gross_pnl": 0.0,
+        "fees": 0.0,
+        "fill_count": 0,
+        "maker_fills": 0,
+        "taker_fills": 0,
+    }
+
+
+def add_fill_to_episode(episode, fill, action):
+    size = to_float(fill["size"])
+    px = to_float(fill["px"])
+    notional = abs(size * px)
+    episode["fees"] += to_float(fill["fee"]) + to_float(fill["builder_fee"])
+    episode["fill_count"] += 1
+    if int(fill["crossed"]):
+        episode["taker_fills"] += 1
+    else:
+        episode["maker_fills"] += 1
+    if action == "open":
+        if episode["opened_at_ms"] is None:
+            episode["opened_at_ms"] = int(fill["time_ms"])
+        episode["open_size"] += size
+        episode["open_notional"] += notional
+    elif action == "close":
+        episode["close_size"] += size
+        episode["close_notional"] += notional
+        episode["gross_pnl"] += to_float(fill["closed_pnl"])
+        episode["closed_at_ms"] = int(fill["time_ms"])
+
+
+def persist_episode(conn, episode, rebuilt_at):
+    avg_entry = episode["open_notional"] / episode["open_size"] if episode["open_size"] else 0.0
+    avg_close = episode["close_notional"] / episode["close_size"] if episode["close_size"] else 0.0
+    net_pnl = episode["gross_pnl"] - episode["fees"]
+    conn.execute(
+        """
+        INSERT INTO trade_episodes (
+            wallet_address, coin, side, status, opened_at_ms, closed_at_ms,
+            open_size, close_size, avg_entry_px, avg_close_px, gross_pnl,
+            fees, net_pnl, fill_count, maker_fills, taker_fills, rebuilt_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            episode["wallet_address"],
+            episode["coin"],
+            episode["side"],
+            episode["status"],
+            episode["opened_at_ms"],
+            episode["closed_at_ms"],
+            episode["open_size"],
+            episode["close_size"],
+            avg_entry,
+            avg_close,
+            episode["gross_pnl"],
+            episode["fees"],
+            net_pnl,
+            episode["fill_count"],
+            episode["maker_fills"],
+            episode["taker_fills"],
+            rebuilt_at,
+        ),
+    )
+
+
+def rebuild_trade_episodes(address):
+    rebuilt_at = now_iso()
+    with connect_db() as conn:
+        conn.execute("DELETE FROM trade_episodes WHERE wallet_address = ?", (address,))
+        fills = conn.execute(
+            """
+            SELECT * FROM fills
+            WHERE wallet_address = ?
+            ORDER BY time_ms ASC, fill_id ASC
+            """,
+            (address,),
+        ).fetchall()
+        active = {}
+        for fill in fills:
+            side = fill_position_side(fill["dir"])
+            action = fill_action(fill["dir"])
+            if not side or not action:
+                continue
+            key = (fill["coin"], side)
+            if action == "open":
+                episode = active.get(key)
+                if not episode:
+                    episode = new_episode(address, fill["coin"], side, int(fill["time_ms"]))
+                    active[key] = episode
+                add_fill_to_episode(episode, fill, action)
+                continue
+
+            episode = active.get(key)
+            if not episode:
+                episode = new_episode(address, fill["coin"], side, None)
+                active[key] = episode
+            add_fill_to_episode(episode, fill, action)
+            remaining = abs(to_float(fill["start_position"])) - abs(to_float(fill["size"]))
+            if remaining <= POSITION_EVENT_EPSILON:
+                episode["status"] = "closed"
+                persist_episode(conn, episode, rebuilt_at)
+                active.pop(key, None)
+
+        for episode in active.values():
+            persist_episode(conn, episode, rebuilt_at)
+
+
+def sync_wallet_fills(address, lookback_days=None):
+    address = address.lower()
+    end_ms = now_ms()
+    lookback_ms = int((lookback_days or FILL_LOOKBACK_DAYS) * 24 * 60 * 60 * 1000)
+    with connect_db() as conn:
+        state = conn.execute(
+            "SELECT last_time_ms FROM fill_sync_state WHERE wallet_address = ?",
+            (address,),
+        ).fetchone()
+        start_ms = int(state["last_time_ms"]) + 1 if state else end_ms - lookback_ms
+
+    total_inserted = 0
+    max_seen = start_ms
+    cursor_ms = start_ms
+    while cursor_ms <= end_ms:
+        fills = fetch_user_fills_by_time(address, cursor_ms, end_ms)
+        if not fills:
+            break
+        with connect_db() as conn:
+            inserted, batch_max = save_fills(conn, address, fills)
+            total_inserted += inserted
+            max_seen = max(max_seen, batch_max)
+        if len(fills) < 2000 or batch_max <= cursor_ms:
+            break
+        cursor_ms = batch_max + 1
+
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO fill_sync_state (wallet_address, last_time_ms, synced_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(wallet_address) DO UPDATE SET
+                last_time_ms=excluded.last_time_ms,
+                synced_at=excluded.synced_at
+            """,
+            (address, max(max_seen, end_ms - 1), now_iso()),
+        )
+    rebuild_trade_episodes(address)
+    return total_inserted
+
+
+def sync_saved_wallet_fills(batch_size=None):
+    batch_size = max(1, int(batch_size or FILL_SYNC_BATCH))
+    wallets = q_all(
+        """
+        SELECT w.address
+        FROM wallets w
+        LEFT JOIN fill_sync_state s ON s.wallet_address = w.address
+        ORDER BY COALESCE(s.synced_at, '') ASC, w.last_seen DESC
+        LIMIT ?
+        """,
+        (batch_size,),
+    )
+    synced = 0
+    errors = []
+    for wallet in wallets:
+        try:
+            sync_wallet_fills(wallet["address"])
+            synced += 1
+        except Exception as exc:
+            errors.append(f"{short_addr(wallet['address'])}: {exc}")
+        time.sleep(0.1)
+    return synced, errors
+
+
 def wallet_name(wallet):
     alias = wallet["alias"] if "alias" in wallet.keys() else ""
     return alias.strip() or short_addr(wallet["address"])
@@ -1021,12 +1351,20 @@ def refresh_saved_wallets(batch_size=None):
 def auto_worker():
     AUTO_STATUS["started"] = True
     next_discovery = time.monotonic() + 5
+    next_fill_sync = time.monotonic() + 10
     while True:
         try:
             refreshed, errors = refresh_saved_wallets()
             AUTO_STATUS["last_refresh"] = f"{now_iso()} | {refreshed} wallets"
             if errors:
                 AUTO_STATUS["last_error"] = "; ".join(errors[-3:])
+
+            if FILL_SYNC_ENABLED and time.monotonic() >= next_fill_sync:
+                synced, fill_errors = sync_saved_wallet_fills()
+                AUTO_STATUS["last_fill_sync"] = f"{now_iso()} | {synced} wallets"
+                if fill_errors:
+                    AUTO_STATUS["last_error"] = "; ".join(fill_errors[-3:])
+                next_fill_sync = time.monotonic() + max(10, FILL_SYNC_INTERVAL)
 
             if AUTO_DISCOVERY_ENABLED and time.monotonic() >= next_discovery:
                 result = scan_wallets(use_live_discovery=True)
@@ -1371,6 +1709,83 @@ def render_events_table(events, compact=False):
     )
 
 
+def ms_to_local_text(ms):
+    if not ms:
+        return "-"
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, timezone.utc).replace(microsecond=0).isoformat()
+    except Exception:
+        return "-"
+
+
+def wallet_trade_stats(address):
+    now_value = now_ms()
+    day_start = now_value - 24 * 60 * 60 * 1000
+    month_start = now_value - 30 * 24 * 60 * 60 * 1000
+    rows = q_all(
+        """
+        SELECT * FROM trade_episodes
+        WHERE wallet_address = ? AND status = 'closed'
+        ORDER BY closed_at_ms DESC
+        """,
+        (address,),
+    )
+    def bucket(start_ms=None):
+        selected = [row for row in rows if start_ms is None or int(row["closed_at_ms"] or 0) >= start_ms]
+        wins = sum(1 for row in selected if to_float(row["net_pnl"]) > 0)
+        gross = sum(to_float(row["gross_pnl"]) for row in selected)
+        fees = sum(to_float(row["fees"]) for row in selected)
+        net = sum(to_float(row["net_pnl"]) for row in selected)
+        losses_abs = sum(abs(to_float(row["net_pnl"])) for row in selected if to_float(row["net_pnl"]) < 0)
+        wins_sum = sum(to_float(row["net_pnl"]) for row in selected if to_float(row["net_pnl"]) > 0)
+        return {
+            "trades": len(selected),
+            "wins": wins,
+            "winrate": wins / len(selected) if selected else 0,
+            "gross": gross,
+            "fees": fees,
+            "net": net,
+            "profit_factor": wins_sum / losses_abs if losses_abs else 0,
+        }
+    return {
+        "day": bucket(day_start),
+        "month": bucket(month_start),
+        "all": bucket(None),
+        "recent": rows[:25],
+    }
+
+
+def render_trade_episodes_table(rows):
+    if not rows:
+        return '<div class="subtle">Aun no hay trades cerrados reconstruidos desde fills.</div>'
+    trs = []
+    for row in rows:
+        trs.append(
+            "<tr>"
+            f"<td>{ms_to_local_text(row['closed_at_ms'])}</td>"
+            f"<td>{html.escape(row['coin'])}</td>"
+            f"<td>{badge(row['side'])}</td>"
+            f"<td>{row['close_size']:,.6f}</td>"
+            f"<td>{price_or_dash(row['avg_entry_px'])}</td>"
+            f"<td>{price_or_dash(row['avg_close_px'])}</td>"
+            f"<td>{signed_full_usd(row['gross_pnl'])}</td>"
+            f"<td>{full_usd(row['fees'])}</td>"
+            f"<td>{signed_full_usd(row['net_pnl'])}</td>"
+            f"<td>{int(row['fill_count'])}</td>"
+            f"<td>{int(row['maker_fills'])}/{int(row['taker_fills'])}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table><thead><tr>'
+        '<th>Cierre</th><th>Coin</th><th>Lado</th><th>Tamano cerrado</th>'
+        '<th>Avg entry</th><th>Avg close</th><th>PnL bruto</th><th>Fees netas</th>'
+        '<th>PnL neto</th><th>Fills</th><th>Maker/Taker</th>'
+        '</tr></thead><tbody>'
+        + "".join(trs)
+        + "</tbody></table></div>"
+    )
+
+
 def dashboard(message=""):
     stats = q_one(
         """
@@ -1411,7 +1826,7 @@ def dashboard(message=""):
       <div>
         <h1>Dashboard general</h1>
         <div class="subtle">Ultimo escaneo: {html.escape(scan_copy)}</div>
-        <div class="subtle">Worker: refresh {html.escape(AUTO_STATUS['last_refresh'] or 'pendiente')} | discovery {html.escape(AUTO_STATUS['last_discovery'] or 'pendiente')}</div>
+        <div class="subtle">Worker: refresh {html.escape(AUTO_STATUS['last_refresh'] or 'pendiente')} | fills {html.escape(AUTO_STATUS['last_fill_sync'] or 'pendiente')} | discovery {html.escape(AUTO_STATUS['last_discovery'] or 'pendiente')}</div>
       </div>
       <form method="post" action="/scan" class="card" style="width:min(520px,100%); box-shadow:none;">
         <div class="form-row">
@@ -1606,6 +2021,8 @@ def wallet_profile(address):
     profile_coins = sorted({str(pos["coin"]) for pos in positions})
     total_capital = sum(pos["capital_used"] for pos in positions)
     total_pnl = sum(pos["unrealized_pnl"] for pos in positions)
+    trade_stats = wallet_trade_stats(address)
+    fill_state = q_one("SELECT * FROM fill_sync_state WHERE wallet_address = ?", (address,))
     for pos in positions:
         rows.append(
             f"<tr class='position-row' data-coin='{html.escape(pos['coin'])}' data-side='{html.escape(pos['side'])}' data-size='{abs(pos['size'])}' data-entry='{pos['entry_px']}' data-margin='{pos['capital_used']}'>"
@@ -1643,6 +2060,9 @@ def wallet_profile(address):
         <form method="post" action="/wallet/{html.escape(address)}/refresh">
           <button class="btn secondary" type="submit">Refrescar</button>
         </form>
+        <form method="post" action="/wallet/{html.escape(address)}/sync-fills">
+          <button class="btn secondary" type="submit">Sync fills</button>
+        </form>
         <a class="btn secondary" href="/wallets">Volver</a>
       </div>
     </div>
@@ -1674,7 +2094,26 @@ def wallet_profile(address):
         <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
         <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
         <tr><th>Ultima lectura</th><td>{html.escape(wallet['last_seen'])}</td></tr>
+        <tr><th>Ultimo sync fills</th><td>{html.escape(fill_state['synced_at'] if fill_state else 'Nunca')}</td></tr>
       </tbody></table>
+    </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>Trading analytics</h2>
+      <div class="grid three">
+        <div><div class="metric-label">Trades 24h</div><div class="metric-value">{trade_stats['day']['trades']}</div><div class="subtle">Winrate {pct(trade_stats['day']['winrate'])}</div></div>
+        <div><div class="metric-label">Trades 30d</div><div class="metric-value">{trade_stats['month']['trades']}</div><div class="subtle">Winrate {pct(trade_stats['month']['winrate'])}</div></div>
+        <div><div class="metric-label">Trades total</div><div class="metric-value">{trade_stats['all']['trades']}</div><div class="subtle">Winrate {pct(trade_stats['all']['winrate'])}</div></div>
+      </div>
+      <div class="grid three" style="margin-top:16px;">
+        <div><div class="metric-label">PnL neto total</div><div class="metric-value">{signed_usd(trade_stats['all']['net'])}</div></div>
+        <div><div class="metric-label">Fees netas total</div><div class="metric-value">{usd(trade_stats['all']['fees'])}</div></div>
+        <div><div class="metric-label">Profit factor</div><div class="metric-value">{trade_stats['all']['profit_factor']:.2f}</div></div>
+      </div>
+    </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>Trades cerrados reales</h2>
+      <div class="subtle">Reconstruido desde userFillsByTime. PnL neto = closedPnl - fee - builderFee reportadas por Hyperliquid.</div>
+      {render_trade_episodes_table(trade_stats['recent'])}
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>PnL de cuenta</h2>
@@ -1961,6 +2400,17 @@ class AppHandler(BaseHTTPRequestHandler):
             if ADDRESS_RE.match(address):
                 try:
                     refresh_wallet_state(address, "manual-refresh")
+                except Exception:
+                    pass
+                self.redirect(f"/wallet/{address}")
+            else:
+                self.redirect("/wallets")
+            return
+        if parsed.path.startswith("/wallet/") and parsed.path.endswith("/sync-fills"):
+            address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/sync-fills", 1)[0]).lower()
+            if ADDRESS_RE.match(address):
+                try:
+                    sync_wallet_fills(address)
                 except Exception:
                     pass
                 self.redirect(f"/wallet/{address}")
