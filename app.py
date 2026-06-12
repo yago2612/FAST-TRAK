@@ -29,6 +29,9 @@ AUTO_DISCOVERY_ENABLED = os.getenv("AUTO_DISCOVERY_ENABLED", "1") == "1"
 AUTO_DISCOVERY_INTERVAL = int(os.getenv("AUTO_DISCOVERY_INTERVAL", "180"))
 AUTO_REFRESH_INTERVAL = float(os.getenv("AUTO_REFRESH_INTERVAL", "5"))
 AUTO_REFRESH_BATCH = int(os.getenv("AUTO_REFRESH_BATCH", "5"))
+TRACKED_REFRESH_INTERVAL = float(os.getenv("TRACKED_REFRESH_INTERVAL", "1"))
+TRACKED_FILL_SYNC_INTERVAL = float(os.getenv("TRACKED_FILL_SYNC_INTERVAL", "2"))
+TRACKED_MAX_WALLETS = int(os.getenv("TRACKED_MAX_WALLETS", "5"))
 POSITION_EVENT_EPSILON = float(os.getenv("POSITION_EVENT_EPSILON", "0.00000001"))
 POSITION_CLOSE_CONFIRMATIONS = int(os.getenv("POSITION_CLOSE_CONFIRMATIONS", "2"))
 MARK_WS_ENABLED = os.getenv("MARK_WS_ENABLED", "1") == "1"
@@ -47,6 +50,7 @@ AUTO_STATUS = {
     "last_refresh": "",
     "last_discovery": "",
     "last_mark": "",
+    "last_tracked": "",
     "last_fill_sync": "",
     "last_error": "",
 }
@@ -173,6 +177,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS wallets (
                 address TEXT PRIMARY KEY,
                 alias TEXT NOT NULL DEFAULT '',
+                tracked INTEGER NOT NULL DEFAULT 0,
+                tracked_at TEXT NOT NULL DEFAULT '',
                 account_value REAL NOT NULL DEFAULT 0,
                 total_ntl_pos REAL NOT NULL DEFAULT 0,
                 total_raw_usd REAL NOT NULL DEFAULT 0,
@@ -344,6 +350,8 @@ def init_db():
             """
         )
         ensure_column(conn, "wallets", "alias", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "wallets", "tracked", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "wallets", "tracked_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "positions", "current_px", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "positions", "capital_used", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "positions", "roi_price", "REAL NOT NULL DEFAULT 0")
@@ -1299,7 +1307,7 @@ def rebuild_trade_episodes(address):
             persist_episode(conn, episode, rebuilt_at)
 
 
-def sync_wallet_fills(address):
+def sync_wallet_fills(address, force_rebuild=False):
     address = address.lower()
     end_ms = now_ms()
     attempted_at = now_iso()
@@ -1377,7 +1385,8 @@ def sync_wallet_fills(address):
             """,
             (address, max(max_seen, end_ms - 1), now_iso(), attempted_at, total_inserted, total_seen),
         )
-    rebuild_trade_episodes(address)
+    if force_rebuild or total_inserted > 0:
+        rebuild_trade_episodes(address)
     return total_inserted
 
 
@@ -1425,6 +1434,19 @@ def save_wallet_alias(address, alias):
         conn.execute("UPDATE wallets SET alias = ? WHERE address = ?", (alias, address.lower()))
 
 
+def set_wallet_tracked(address, tracked):
+    address = address.lower()
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE wallets
+            SET tracked = ?, tracked_at = ?
+            WHERE address = ?
+            """,
+            (1 if tracked else 0, now_iso() if tracked else "", address),
+        )
+
+
 def refresh_wallet_state(address, source="refresh", mark_prices=None):
     address = (address or "").lower()
     if not ADDRESS_RE.match(address):
@@ -1434,6 +1456,52 @@ def refresh_wallet_state(address, source="refresh", mark_prices=None):
     wallet = parse_wallet(address, state, source, mark_prices)
     save_wallet(wallet)
     return True
+
+
+def tracked_wallet_rows():
+    return q_all(
+        """
+        SELECT address
+        FROM wallets
+        WHERE tracked = 1
+        ORDER BY tracked_at ASC, (account_value + margin_used) DESC
+        LIMIT ?
+        """,
+        (max(1, TRACKED_MAX_WALLETS),),
+    )
+
+
+def refresh_tracked_wallets():
+    wallets = tracked_wallet_rows()
+    refreshed = 0
+    errors = []
+    if not wallets:
+        return refreshed, errors
+    mark_prices = fetch_mark_prices()
+    for wallet in wallets:
+        try:
+            if refresh_wallet_state(wallet["address"], "tracked-refresh", mark_prices):
+                refreshed += 1
+        except Exception as exc:
+            errors.append(f"{short_addr(wallet['address'])}: {exc}")
+        time.sleep(0.05)
+    return refreshed, errors
+
+
+def sync_tracked_wallet_fills():
+    wallets = tracked_wallet_rows()
+    synced = 0
+    inserted_total = 0
+    errors = []
+    for wallet in wallets:
+        try:
+            inserted = sync_wallet_fills(wallet["address"])
+            inserted_total += inserted
+            synced += 1
+        except Exception as exc:
+            errors.append(f"{short_addr(wallet['address'])}: {exc}")
+        time.sleep(0.05)
+    return synced, inserted_total, errors
 
 
 def refresh_saved_wallets(batch_size=None):
@@ -1457,33 +1525,56 @@ def refresh_saved_wallets(batch_size=None):
 
 def auto_worker():
     AUTO_STATUS["started"] = True
+    next_tracked_refresh = time.monotonic()
+    next_tracked_fill_sync = time.monotonic() + 1
+    next_general_refresh = time.monotonic()
     next_discovery = time.monotonic() + 5
     next_fill_sync = time.monotonic() + 10
     while True:
         try:
-            refreshed, errors = refresh_saved_wallets()
-            AUTO_STATUS["last_refresh"] = f"{now_iso()} | {refreshed} wallets"
-            if errors:
-                AUTO_STATUS["last_error"] = "; ".join(errors[-3:])
+            now_tick = time.monotonic()
 
-            if FILL_SYNC_ENABLED and time.monotonic() >= next_fill_sync:
+            if now_tick >= next_tracked_refresh:
+                tracked_refreshed, tracked_errors = refresh_tracked_wallets()
+                if tracked_refreshed or tracked_errors:
+                    AUTO_STATUS["last_tracked"] = f"{now_iso()} | refresh {tracked_refreshed}/{TRACKED_MAX_WALLETS}"
+                if tracked_errors:
+                    AUTO_STATUS["last_error"] = "; ".join(tracked_errors[-3:])
+                next_tracked_refresh = now_tick + max(0.5, TRACKED_REFRESH_INTERVAL)
+
+            if now_tick >= next_general_refresh:
+                refreshed, errors = refresh_saved_wallets()
+                AUTO_STATUS["last_refresh"] = f"{now_iso()} | {refreshed} wallets"
+                if errors:
+                    AUTO_STATUS["last_error"] = "; ".join(errors[-3:])
+                next_general_refresh = now_tick + max(1.0, AUTO_REFRESH_INTERVAL)
+
+            if now_tick >= next_tracked_fill_sync:
+                tracked_synced, tracked_inserted, tracked_fill_errors = sync_tracked_wallet_fills()
+                if tracked_synced or tracked_inserted or tracked_fill_errors:
+                    AUTO_STATUS["last_tracked"] = f"{now_iso()} | refresh/fills {tracked_synced}/{TRACKED_MAX_WALLETS} | +{tracked_inserted}"
+                if tracked_fill_errors:
+                    AUTO_STATUS["last_error"] = "; ".join(tracked_fill_errors[-3:])
+                next_tracked_fill_sync = now_tick + max(1.0, TRACKED_FILL_SYNC_INTERVAL)
+
+            if FILL_SYNC_ENABLED and now_tick >= next_fill_sync:
                 synced, fill_errors = sync_saved_wallet_fills()
                 AUTO_STATUS["last_fill_sync"] = f"{now_iso()} | {synced}/{FILL_SYNC_TOP_N} top wallets"
                 if fill_errors:
                     AUTO_STATUS["last_error"] = "; ".join(fill_errors[-3:])
-                next_fill_sync = time.monotonic() + max(10, FILL_SYNC_INTERVAL)
+                next_fill_sync = now_tick + max(10, FILL_SYNC_INTERVAL)
 
-            if AUTO_DISCOVERY_ENABLED and time.monotonic() >= next_discovery:
+            if AUTO_DISCOVERY_ENABLED and now_tick >= next_discovery:
                 result = scan_wallets(use_live_discovery=True)
                 AUTO_STATUS["last_discovery"] = (
                     f"{now_iso()} | {result['discovered']} candidatas | {result['new']} nuevas | {result['updated']} repetidas"
                 )
                 if result["errors"]:
                     AUTO_STATUS["last_error"] = "; ".join(result["errors"][-3:])
-                next_discovery = time.monotonic() + max(60, AUTO_DISCOVERY_INTERVAL)
+                next_discovery = now_tick + max(60, AUTO_DISCOVERY_INTERVAL)
         except Exception as exc:
             AUTO_STATUS["last_error"] = str(exc)
-        time.sleep(max(1.0, AUTO_REFRESH_INTERVAL))
+        time.sleep(0.25)
 
 
 def start_auto_worker():
@@ -1950,7 +2041,7 @@ def dashboard(message=""):
       <div>
         <h1>Dashboard general</h1>
         <div class="subtle">Ultimo escaneo: {html.escape(scan_copy)}</div>
-        <div class="subtle">Worker: refresh {html.escape(AUTO_STATUS['last_refresh'] or 'pendiente')} | fills {html.escape(AUTO_STATUS['last_fill_sync'] or 'pendiente')} | discovery {html.escape(AUTO_STATUS['last_discovery'] or 'pendiente')}</div>
+        <div class="subtle">Worker: live {html.escape(AUTO_STATUS['last_tracked'] or 'sin wallets seguidas')} | refresh {html.escape(AUTO_STATUS['last_refresh'] or 'pendiente')} | fills {html.escape(AUTO_STATUS['last_fill_sync'] or 'pendiente')} | discovery {html.escape(AUTO_STATUS['last_discovery'] or 'pendiente')}</div>
       </div>
       <form method="post" action="/scan" class="card" style="width:min(520px,100%); box-shadow:none;">
         <div class="form-row">
@@ -2043,9 +2134,11 @@ def wallets_page(query="", bias=""):
     for row in rows:
         coins = ", ".join((row["coins"] or "").split(",")[:5]) or "-"
         total = row["account_value"] + row["margin_used"]
+        tracked = int(row["tracked"] or 0)
         trs.append(
             "<tr>"
             f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{html.escape(row['address'])}</div></td>"
+            f"<td>{badge('Seguida' if tracked else 'Normal')}</td>"
             f"<td>{usd(row['account_value'])}</td>"
             f"<td>{usd(row['margin_used'])}</td>"
             f"<td>{usd(row['total_ntl_pos'])}</td>"
@@ -2086,9 +2179,9 @@ def wallets_page(query="", bias=""):
     <section class="card">
       <h2>Listado</h2>
       <div class="table-wrap"><table><thead><tr>
-        <th>Wallet</th><th>Balance</th><th>Margen pos.</th><th>Notional</th><th>Balance + margen</th>
+        <th>Wallet</th><th>Modo</th><th>Balance</th><th>Margen pos.</th><th>Notional</th><th>Balance + margen</th>
         <th>Long notional</th><th>Short notional</th><th>Activas</th><th>Sesgo</th><th>Coins</th><th>Actualizada</th>
-      </tr></thead><tbody>{''.join(trs) or '<tr><td colspan="11">Sin wallets guardadas.</td></tr>'}</tbody></table></div>
+      </tr></thead><tbody>{''.join(trs) or '<tr><td colspan="12">Sin wallets guardadas.</td></tr>'}</tbody></table></div>
     </section>
     """
     return render_layout("Wallets", body, "wallets")
@@ -2147,6 +2240,9 @@ def wallet_profile(address, message=""):
     total_pnl = sum(pos["unrealized_pnl"] for pos in positions)
     trade_stats = wallet_trade_stats(address)
     fill_state = q_one("SELECT * FROM fill_sync_state WHERE wallet_address = ?", (address,))
+    is_tracked = int(wallet["tracked"] or 0) == 1
+    track_label = "Dejar de seguir" if is_tracked else "Seguir live"
+    track_value = "0" if is_tracked else "1"
     for pos in positions:
         rows.append(
             f"<tr class='position-row' data-coin='{html.escape(pos['coin'])}' data-side='{html.escape(pos['side'])}' data-size='{abs(pos['size'])}' data-entry='{pos['entry_px']}' data-margin='{pos['capital_used']}'>"
@@ -2187,6 +2283,10 @@ def wallet_profile(address, message=""):
         <form method="post" action="/wallet/{html.escape(address)}/sync-fills">
           <button class="btn secondary" type="submit">Sync fills</button>
         </form>
+        <form method="post" action="/wallet/{html.escape(address)}/track">
+          <input type="hidden" name="tracked" value="{track_value}">
+          <button class="btn {'secondary' if is_tracked else ''}" type="submit">{track_label}</button>
+        </form>
         <a class="btn secondary" href="/wallets">Volver</a>
       </div>
     </div>
@@ -2218,8 +2318,10 @@ def wallet_profile(address, message=""):
         <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
         <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
         <tr><th>Ultima lectura</th><td>{html.escape(wallet['last_seen'])}</td></tr>
+        <tr><th>Modo live</th><td>{'Seguida cada ~' + str(TRACKED_REFRESH_INTERVAL) + 's' if is_tracked else 'Normal'}</td></tr>
         <tr><th>Ultimo sync fills</th><td>{html.escape(fill_sync_status(fill_state))}</td></tr>
       </tbody></table>
+      <div class="subtle" style="margin-top:10px;">El modo live detecta cambios de posiciones por refresh rapido; los trades cerrados y winrate se confirman con fills reales.</div>
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Trading analytics</h2>
@@ -2535,10 +2637,20 @@ class AppHandler(BaseHTTPRequestHandler):
             address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/sync-fills", 1)[0]).lower()
             if ADDRESS_RE.match(address):
                 try:
-                    inserted = sync_wallet_fills(address)
+                    inserted = sync_wallet_fills(address, force_rebuild=True)
                     msg = f"Sync fills OK: {inserted} fills nuevos."
                 except Exception as exc:
                     msg = f"Sync fills fallo: {str(exc)[:180]}"
+                self.redirect(f"/wallet/{address}?message=" + urllib.parse.quote(msg))
+            else:
+                self.redirect("/wallets")
+            return
+        if parsed.path.startswith("/wallet/") and parsed.path.endswith("/track"):
+            address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/track", 1)[0]).lower()
+            if ADDRESS_RE.match(address):
+                tracked = form.get("tracked") == "1"
+                set_wallet_tracked(address, tracked)
+                msg = "Wallet marcada para seguimiento live." if tracked else "Wallet removida del seguimiento live."
                 self.redirect(f"/wallet/{address}?message=" + urllib.parse.quote(msg))
             else:
                 self.redirect("/wallets")

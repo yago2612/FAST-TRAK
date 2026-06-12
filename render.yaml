@@ -22,6 +22,12 @@ services:
         value: "5"
       - key: AUTO_REFRESH_BATCH
         value: "5"
+      - key: TRACKED_REFRESH_INTERVAL
+        value: "1"
+      - key: TRACKED_FILL_SYNC_INTERVAL
+        value: "2"
+      - key: TRACKED_MAX_WALLETS
+        value: "5"
       - key: POSITION_CLOSE_CONFIRMATIONS
         value: "2"
       - key: MARK_WS_ENABLED

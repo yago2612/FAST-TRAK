@@ -58,6 +58,7 @@ Mientras el servicio esta despierto, la app arranca un worker interno que:
 - en el perfil de wallet, actualiza Mark px, Notional, uPnL y ROI con precios live desde WebSocket `allMids` cada `PRICE_UI_REFRESH_MS` milisegundos.
 - sincroniza fills reales para reconstruir trades cerrados, winrate, PnL neto y fees reales. El primer sync toma los fills mas recientes con `userFills`; luego usa `userFillsByTime` incremental desde el ultimo fill sincronizado.
 - por defecto, el sync automatico de fills se limita al top 10 por capital real aproximado (`account_value + margin_used`) para evitar sobrecargar el servicio.
+- permite marcar wallets como "seguida" desde el perfil. Esas wallets se refrescan con prioridad cada `TRACKED_REFRESH_INTERVAL` segundos y sincronizan fills cada `TRACKED_FILL_SYNC_INTERVAL` segundos, hasta `TRACKED_MAX_WALLETS`.
 
 En Render Free esto no es 24/7 garantizado porque el servicio puede dormirse, reiniciarse o perder SQLite local. Para monitoreo serio conviene Render pago + Postgres + worker separado.
 
@@ -78,6 +79,9 @@ AUTO_DISCOVERY_ENABLED=1
 AUTO_DISCOVERY_INTERVAL=180
 AUTO_REFRESH_INTERVAL=5
 AUTO_REFRESH_BATCH=5
+TRACKED_REFRESH_INTERVAL=1
+TRACKED_FILL_SYNC_INTERVAL=2
+TRACKED_MAX_WALLETS=5
 POSITION_CLOSE_CONFIRMATIONS=2
 MARK_WS_ENABLED=1
 PRICE_UI_REFRESH_MS=200
