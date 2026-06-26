@@ -32,7 +32,8 @@ AUTO_DISCOVERY_INTERVAL = int(os.getenv("AUTO_DISCOVERY_INTERVAL", "180"))
 AUTO_REFRESH_INTERVAL = float(os.getenv("AUTO_REFRESH_INTERVAL", "5"))
 AUTO_REFRESH_BATCH = int(os.getenv("AUTO_REFRESH_BATCH", "5"))
 TRACKED_REFRESH_INTERVAL = float(os.getenv("TRACKED_REFRESH_INTERVAL", "1"))
-TRACKED_FILL_SYNC_INTERVAL = float(os.getenv("TRACKED_FILL_SYNC_INTERVAL", "2"))
+TRACKED_FILL_SYNC_INTERVAL = float(os.getenv("TRACKED_FILL_SYNC_INTERVAL", "1"))
+TRACKED_LEDGER_SYNC_INTERVAL = float(os.getenv("TRACKED_LEDGER_SYNC_INTERVAL", "1"))
 TRACKED_MAX_WALLETS = int(os.getenv("TRACKED_MAX_WALLETS", "5"))
 POSITION_EVENT_EPSILON = float(os.getenv("POSITION_EVENT_EPSILON", "0.00000001"))
 POSITION_CLOSE_CONFIRMATIONS = int(os.getenv("POSITION_CLOSE_CONFIRMATIONS", "2"))
@@ -273,6 +274,7 @@ def init_db():
                 gross_exposure REAL NOT NULL DEFAULT 0,
                 long_value REAL NOT NULL DEFAULT 0,
                 short_value REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
                 active_positions INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
@@ -437,6 +439,7 @@ def init_db():
         ensure_column(conn, "fill_sync_state", "last_error", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "fill_sync_state", "last_inserted", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "fill_sync_state", "last_seen_fills", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "wallet_snapshots", "unrealized_pnl", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "ledger_updates", "amount_usdc", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "ledger_updates", "flow_usdc", "REAL NOT NULL DEFAULT 0")
         ensure_column(conn, "ledger_updates", "fee_usdc", "REAL NOT NULL DEFAULT 0")
@@ -948,8 +951,8 @@ def save_wallet(wallet):
             """
             INSERT INTO wallet_snapshots (
                 wallet_address, account_value, total_ntl_pos, gross_exposure,
-                long_value, short_value, active_positions, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                long_value, short_value, unrealized_pnl, active_positions, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 wallet["address"],
@@ -958,6 +961,7 @@ def save_wallet(wallet):
                 wallet["gross_exposure"],
                 wallet["long_value"],
                 wallet["short_value"],
+                sum(to_float(position["unrealized_pnl"]) for position in wallet["positions"]),
                 wallet["active_positions"],
                 seen,
             ),
@@ -1802,12 +1806,16 @@ def reset_all_pnl_graphs():
             """
         ).fetchall()
         for wallet in wallets:
+            upnl = conn.execute(
+                "SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions WHERE wallet_address = ?",
+                (wallet["address"],),
+            ).fetchone()[0]
             conn.execute(
                 """
                 INSERT INTO wallet_snapshots (
                     wallet_address, account_value, total_ntl_pos, gross_exposure,
-                    long_value, short_value, active_positions, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    long_value, short_value, unrealized_pnl, active_positions, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     wallet["address"],
@@ -1816,6 +1824,7 @@ def reset_all_pnl_graphs():
                     wallet["gross_exposure"],
                     wallet["long_value"],
                     wallet["short_value"],
+                    to_float(upnl),
                     wallet["active_positions"],
                     reset_at,
                 ),
@@ -2039,7 +2048,7 @@ def auto_worker():
                     AUTO_STATUS["last_tracked"] = f"{now_iso()} | refresh/fills {tracked_synced}/{TRACKED_MAX_WALLETS} | +{tracked_inserted}"
                 if tracked_fill_errors:
                     AUTO_STATUS["last_error"] = "; ".join(tracked_fill_errors[-3:])
-                next_tracked_fill_sync = now_tick + max(1.0, TRACKED_FILL_SYNC_INTERVAL)
+                next_tracked_fill_sync = now_tick + max(0.5, TRACKED_FILL_SYNC_INTERVAL)
 
             if LEDGER_SYNC_ENABLED and now_tick >= next_tracked_ledger_sync:
                 ledger_synced, ledger_inserted, ledger_errors = sync_tracked_wallet_ledgers()
@@ -2047,7 +2056,7 @@ def auto_worker():
                     AUTO_STATUS["last_ledger_sync"] = f"{now_iso()} | live {ledger_synced}/{TRACKED_MAX_WALLETS} | +{ledger_inserted}"
                 if ledger_errors:
                     AUTO_STATUS["last_error"] = "; ".join(ledger_errors[-3:])
-                next_tracked_ledger_sync = now_tick + max(2.0, TRACKED_FILL_SYNC_INTERVAL)
+                next_tracked_ledger_sync = now_tick + max(0.5, TRACKED_LEDGER_SYNC_INTERVAL)
 
             if FILL_SYNC_ENABLED and now_tick >= next_fill_sync:
                 synced, fill_errors = sync_saved_wallet_fills()
@@ -2532,6 +2541,85 @@ def wallet_ledger_summary(address, start_ms=0, end_ms=None):
     }
 
 
+def wallet_closed_pnl_points(address, start_ms, end_ms):
+    return q_all(
+        """
+        SELECT closed_at_ms, net_pnl
+        FROM trade_episodes
+        WHERE wallet_address = ?
+          AND status = 'closed'
+          AND closed_at_ms > ?
+          AND closed_at_ms <= ?
+        ORDER BY closed_at_ms ASC, id ASC
+        """,
+        (address, int(start_ms or 0), int(end_ms or 0)),
+    )
+
+
+def wallet_pnl_reconciliation(snapshots, address):
+    if len(snapshots) < 2:
+        return None
+
+    times = [iso_to_epoch_ms(row["created_at"]) for row in snapshots]
+    values = [to_float(row["account_value"]) for row in snapshots]
+    upnls = [to_float(row_value(row, "unrealized_pnl", 0)) for row in snapshots]
+    base_time = times[0]
+    base_value = values[0]
+    base_upnl = upnls[0]
+    end_time = times[-1]
+
+    ledger_rows = q_all(
+        """
+        SELECT time_ms, flow_usdc
+        FROM ledger_updates
+        WHERE wallet_address = ?
+          AND time_ms > ?
+          AND time_ms <= ?
+        ORDER BY time_ms ASC
+        """,
+        (address, base_time, end_time),
+    )
+    closed_rows = wallet_closed_pnl_points(address, base_time, end_time)
+
+    flow_points = []
+    closed_points = []
+    flow_index = 0
+    closed_index = 0
+    cumulative_flow = 0.0
+    cumulative_closed = 0.0
+    for snapshot_time in times:
+        while flow_index < len(ledger_rows) and int(ledger_rows[flow_index]["time_ms"]) <= snapshot_time:
+            cumulative_flow += to_float(ledger_rows[flow_index]["flow_usdc"])
+            flow_index += 1
+        while closed_index < len(closed_rows) and int(closed_rows[closed_index]["closed_at_ms"]) <= snapshot_time:
+            cumulative_closed += to_float(closed_rows[closed_index]["net_pnl"])
+            closed_index += 1
+        flow_points.append(cumulative_flow)
+        closed_points.append(cumulative_closed)
+
+    equity_delta = [value - base_value for value in values]
+    upnl_delta = [upnl - base_upnl for upnl in upnls]
+    operating_pnl = [delta - flow for delta, flow in zip(equity_delta, flow_points)]
+    residual = [
+        operating - closed - open_delta
+        for operating, closed, open_delta in zip(operating_pnl, closed_points, upnl_delta)
+    ]
+    return {
+        "times": times,
+        "base_time": base_time,
+        "base_value": base_value,
+        "base_upnl": base_upnl,
+        "equity_delta": equity_delta,
+        "flow_points": flow_points,
+        "closed_points": closed_points,
+        "upnl_delta": upnl_delta,
+        "operating_pnl": operating_pnl,
+        "residual": residual,
+        "ledger_events": len(ledger_rows),
+        "closed_events": len(closed_rows),
+    }
+
+
 def ledger_sync_status(state):
     if not state:
         return "Nunca"
@@ -2579,33 +2667,21 @@ def render_ledger_table(rows):
 def render_account_pnl_chart(snapshots, address):
     if len(snapshots) < 2:
         return '<div class="subtle">Aun no hay suficientes snapshots para graficar PnL historico.</div>'
-    times = [iso_to_epoch_ms(row["created_at"]) for row in snapshots]
-    values = [to_float(row["account_value"]) for row in snapshots]
-    base_time = times[0]
-    base_value = values[0]
-    ledger_rows = q_all(
-        """
-        SELECT time_ms, flow_usdc
-        FROM ledger_updates
-        WHERE wallet_address = ?
-          AND time_ms > ?
-          AND time_ms <= ?
-        ORDER BY time_ms ASC
-        """,
-        (address, base_time, times[-1]),
-    )
-    flow_points = []
-    flow_index = 0
-    cumulative_flow = 0.0
-    for snapshot_time in times:
-        while flow_index < len(ledger_rows) and int(ledger_rows[flow_index]["time_ms"]) <= snapshot_time:
-            cumulative_flow += to_float(ledger_rows[flow_index]["flow_usdc"])
-            flow_index += 1
-        flow_points.append(cumulative_flow)
+    reconciliation = wallet_pnl_reconciliation(snapshots, address)
+    if not reconciliation:
+        return '<div class="subtle">Aun no hay suficientes snapshots para graficar PnL historico.</div>'
 
-    equity_delta = [value - base_value for value in values]
-    adjusted_pnl = [delta - flow for delta, flow in zip(equity_delta, flow_points)]
-    all_values = adjusted_pnl + [0.0]
+    times = reconciliation["times"]
+    base_value = reconciliation["base_value"]
+    base_upnl = reconciliation["base_upnl"]
+    equity_delta = reconciliation["equity_delta"]
+    flow_points = reconciliation["flow_points"]
+    closed_points = reconciliation["closed_points"]
+    upnl_delta = reconciliation["upnl_delta"]
+    operating_pnl = reconciliation["operating_pnl"]
+    residual = reconciliation["residual"]
+
+    all_values = operating_pnl + closed_points + upnl_delta + residual + [0.0]
     min_pnl = min(all_values)
     max_pnl = max(all_values)
     span = max(max_pnl - min_pnl, 1)
@@ -2630,21 +2706,42 @@ def render_account_pnl_chart(snapshots, address):
     zero_y = y_at(0)
     last_equity = equity_delta[-1]
     last_flow = flow_points[-1]
-    last_adjusted = adjusted_pnl[-1]
-    ledger_summary = wallet_ledger_summary(address, base_time, times[-1])
+    last_closed = closed_points[-1]
+    last_upnl_delta = upnl_delta[-1]
+    last_operating = operating_pnl[-1]
+    last_residual = residual[-1]
+    explain_rows = "".join(
+        f"<tr><th>{label}</th><td>{value}</td></tr>"
+        for label, value in [
+            ("Cambio equity bruto", signed_full_usd(last_equity)),
+            ("Flujo externo neto", signed_full_usd(last_flow)),
+            ("PnL operativo estimado", signed_full_usd(last_operating)),
+            ("PnL cerrado por fills", signed_full_usd(last_closed)),
+            ("Cambio uPnL abierto", signed_full_usd(last_upnl_delta)),
+            ("Residual no explicado", signed_full_usd(last_residual)),
+        ]
+    )
     return f"""
       <div class="grid three" style="margin-bottom:12px;">
         <div><div class="metric-label">Cambio equity</div><div class="metric-value">{signed_usd(last_equity)}</div></div>
         <div><div class="metric-label">Flujo externo neto</div><div class="metric-value">{signed_usd(last_flow)}</div></div>
-        <div><div class="metric-label">PnL ajustado</div><div class="metric-value">{signed_usd(last_adjusted)}</div></div>
+        <div><div class="metric-label">PnL operativo</div><div class="metric-value">{signed_usd(last_operating)}</div></div>
       </div>
-      <svg viewBox="0 0 {width} {height}" role="img" aria-label="Grafico de PnL ajustado de cuenta" style="width:100%; height:240px;">
+      <div class="grid three" style="margin-bottom:12px;">
+        <div><div class="metric-label">PnL cerrado fills</div><div class="metric-value">{signed_usd(last_closed)}</div><div class="subtle">{reconciliation['closed_events']} cierres</div></div>
+        <div><div class="metric-label">Cambio uPnL abierto</div><div class="metric-value">{signed_usd(last_upnl_delta)}</div><div class="subtle">Base uPnL {signed_full_usd(base_upnl)}</div></div>
+        <div><div class="metric-label">Residual no explicado</div><div class="metric-value">{signed_usd(last_residual)}</div><div class="subtle">Funding, fees faltantes o data incompleta</div></div>
+      </div>
+      <svg viewBox="0 0 {width} {height}" role="img" aria-label="Grafico de PnL operativo de cuenta" style="width:100%; height:240px;">
         <line x1="{pad_x}" y1="{zero_y:.1f}" x2="{width - pad_x}" y2="{zero_y:.1f}" stroke="#dfe5ef" stroke-width="1" />
-        <polyline points="{make_points(adjusted_pnl)}" fill="none" stroke="#14865f" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+        <polyline points="{make_points(operating_pnl)}" fill="none" stroke="#14865f" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+        <polyline points="{make_points(closed_points)}" fill="none" stroke="#2f68d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity=".75" />
+        <polyline points="{make_points(upnl_delta)}" fill="none" stroke="#c7781a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity=".75" />
         <text x="{pad_x}" y="18" fill="#647086" font-size="12">Base equity {full_usd(base_value)}</text>
-        <text x="{width - pad_x}" y="18" text-anchor="end" fill="#14865f" font-size="12">PnL ajustado {('+' if last_adjusted > 0 else '') + full_usd(abs(last_adjusted))}</text>
+        <text x="{width - pad_x}" y="18" text-anchor="end" fill="#14865f" font-size="12">PnL operativo {('+' if last_operating > 0 else '') + full_usd(abs(last_operating))}</text>
       </svg>
-      <div class="subtle">Linea verde: cambio de equity descontando entradas/salidas detectadas. Los flujos no-trading se muestran aparte en Movimientos de capital. Movimientos ledger en ventana: {ledger_summary['events']}.</div>
+      <div class="subtle">Verde: equity descontando flujos externos. Azul: PnL cerrado neto desde fills. Naranja: cambio de uPnL abierto. Residual = verde - azul - naranja. Movimientos ledger en ventana: {reconciliation['ledger_events']}. Si el grafico mezcla snapshots anteriores a esta version, usa Reset PnL una vez para fijar una base limpia.</div>
+      <div class="table-wrap" style="margin-top:12px;"><table><tbody>{explain_rows}</tbody></table></div>
     """
 
 
@@ -4212,6 +4309,7 @@ def wallet_profile(address, message=""):
         "<tr>"
         f"<td>{html.escape(peru_time_text(s['created_at']))}</td>"
         f"<td>{usd(s['account_value'])}</td>"
+        f"<td>{signed_full_usd(row_value(s, 'unrealized_pnl', 0))}</td>"
         f"<td>{usd(s['total_ntl_pos'])}</td>"
         f"<td>{int(s['active_positions'])}</td>"
         "</tr>"
@@ -4222,18 +4320,9 @@ def wallet_profile(address, message=""):
       <div>
         <h1>{html.escape(wallet_name(wallet))}</h1>
         <div class="subtle">{html.escape(address)}</div>
-        <div class="subtle">Precios live cada {PRICE_UI_REFRESH_MS}ms | Mark stream: <span id="mark-age">esperando</span> | Worker: {html.escape(peru_status_text(AUTO_STATUS['last_refresh']) or 'esperando datos')}</div>
+        <div class="subtle">Precios live cada {PRICE_UI_REFRESH_MS}ms | Mark stream: <span id="mark-age">esperando</span> | Worker live: {html.escape(peru_status_text(AUTO_STATUS['last_tracked']) or 'sin wallets seguidas')}</div>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
-        <form method="post" action="/wallet/{html.escape(address)}/refresh">
-          <button class="btn secondary" type="submit">Refrescar</button>
-        </form>
-        <form method="post" action="/wallet/{html.escape(address)}/sync-fills">
-          <button class="btn secondary" type="submit">Sync fills</button>
-        </form>
-        <form method="post" action="/wallet/{html.escape(address)}/sync-ledger">
-          <button class="btn secondary" type="submit">Sync ledger</button>
-        </form>
         <form method="post" action="/wallet/{html.escape(address)}/track">
           <input type="hidden" name="tracked" value="{track_value}">
           <button class="btn {'secondary' if is_tracked else ''}" type="submit">{track_label}</button>
@@ -4275,11 +4364,11 @@ def wallet_profile(address, message=""):
         <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
         <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
         <tr><th>Ultima lectura</th><td>{html.escape(peru_time_text(wallet['last_seen']))}</td></tr>
-        <tr><th>Modo live</th><td>{'Seguida cada ~' + str(TRACKED_REFRESH_INTERVAL) + 's' if is_tracked else 'Normal'}</td></tr>
+        <tr><th>Modo live</th><td>{'Seguida: posiciones ~' + str(TRACKED_REFRESH_INTERVAL) + 's, fills ~' + str(TRACKED_FILL_SYNC_INTERVAL) + 's, ledger ~' + str(TRACKED_LEDGER_SYNC_INTERVAL) + 's' if is_tracked else 'Normal'}</td></tr>
         <tr><th>Ultimo sync fills</th><td>{html.escape(fill_sync_status(fill_state))}</td></tr>
         <tr><th>Ultimo sync ledger</th><td>{html.escape(ledger_sync_status(ledger_state))}</td></tr>
       </tbody></table>
-      <div class="subtle" style="margin-top:10px;">El modo live detecta cambios de posiciones por refresh rapido; los trades cerrados y winrate se confirman con fills reales.</div>
+      <div class="subtle" style="margin-top:10px;">El modo live refresca posiciones, fills y ledger automaticamente para las wallets seguidas. Los trades cerrados y winrate se confirman con fills reales.</div>
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Trading analytics</h2>
@@ -4307,8 +4396,8 @@ def wallet_profile(address, message=""):
     <section class="card" style="margin-top:16px;">
       <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
         <div>
-          <h2>PnL ajustado por flujos</h2>
-          <div class="subtle">USDC base de Hyperliquid perps. PnL ajustado = cambio de accountValue - entradas/salidas detectadas por ledger.</div>
+          <h2>Reconciliacion PnL de cuenta</h2>
+          <div class="subtle">USDC base de Hyperliquid perps. PnL operativo = cambio de accountValue - flujos externos; luego se separa entre PnL cerrado, cambio de uPnL abierto y residual.</div>
         </div>
         <form method="post" action="/reset-pnl">
           <button class="btn secondary" type="submit">Reset PnL</button>
@@ -4345,7 +4434,7 @@ def wallet_profile(address, message=""):
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Snapshots</h2>
-      <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Balance</th><th>Posiciones</th><th>Activas</th></tr></thead><tbody>{snap_rows or '<tr><td colspan="4">Sin snapshots</td></tr>'}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Equity</th><th>uPnL</th><th>Notional</th><th>Activas</th></tr></thead><tbody>{snap_rows or '<tr><td colspan="5">Sin snapshots</td></tr>'}</tbody></table></div>
     </section>
     <script>
       const watchedCoins = {json.dumps(profile_coins)};
