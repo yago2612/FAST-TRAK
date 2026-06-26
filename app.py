@@ -2172,7 +2172,7 @@ def render_layout(title, body, active="dashboard", message=""):
         ("wallets", "/wallets", "Wallets"),
         ("events", "/events", "Actividad"),
         ("whale", "/whale-view", "Whale view"),
-        ("trends", "/trends", "Tendencias"),
+        ("trends", "/trends", "Whale Analyzer"),
     ]
     links = "".join(
         f'<a class="nav-link {"active" if key == active else ""}" href="{href}">{label}</a>'
@@ -4590,6 +4590,16 @@ def trends():
         LIMIT 5
         """
     )
+    tracked = q_all(
+        """
+        SELECT *
+        FROM wallets
+        WHERE tracked = 1
+        ORDER BY tracked_at ASC, account_value DESC
+        LIMIT ?
+        """,
+        (max(1, TRACKED_MAX_WALLETS),),
+    )
     total_long = sum(row["long_value"] for row in top)
     total_short = sum(row["short_value"] for row in top)
     gross = total_long + total_short
@@ -4622,20 +4632,34 @@ def trends():
         f'<div class="bar"><span></span><div class="track"><div class="fill short" style="width:{min(100, row["short_value"] / max_value * 100):.1f}%"></div></div><span>{usd(row["short_value"])}</span></div>'
         for row in coin_rows
     )
-    cards = "".join(
-        f'<div class="card"><h2>{wallet_link(row["address"], wallet_name(row))}</h2><div class="subtle">{html.escape(trend_sentence(row))}</div>'
-        f'<table style="margin-top:12px;"><tbody><tr><th>Equity real</th><td>{usd(row["account_value"])}</td></tr>'
-        f'<tr><th>Margen pos.</th><td>{usd(row["margin_used"])}</td></tr>'
-        f'<tr><th>Notional</th><td>{usd(row["total_ntl_pos"])}</td></tr>'
-        f'<tr><th>Long</th><td>{usd(row["long_value"])}</td></tr><tr><th>Short</th><td>{usd(row["short_value"])}</td></tr>'
-        f'<tr><th>Diversificacion</th><td>{pct(row["diversification_score"])}</td></tr></tbody></table></div>'
-        for row in top
+    top_rows = "".join(
+        "<tr>"
+        f"<td>{idx}</td>"
+        f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{short_addr(row['address'])}</div></td>"
+        f"<td>{usd(row['account_value'])}<div class='subtle'>Seleccion: equity real</div></td>"
+        f"<td>{int(row['active_positions'])}</td>"
+        f"<td>{badge(row['direction_bias'])}</td>"
+        f"<td>{html.escape(row['top_coin'] or '-')}</td>"
+        "</tr>"
+        for idx, row in enumerate(top, 1)
+    )
+    tracked_rows = "".join(
+        "<tr>"
+        f"<td>{idx}</td>"
+        f"<td>{wallet_link(row['address'], wallet_name(row))}<div class='subtle'>{short_addr(row['address'])}</div></td>"
+        f"<td>{usd(row['account_value'])}</td>"
+        f"<td>{int(row['active_positions'])}</td>"
+        f"<td>{badge(row['direction_bias'])}</td>"
+        f"<td>{html.escape(row['top_coin'] or '-')}</td>"
+        f"<td>{html.escape(peru_time_text(row['tracked_at']))}</td>"
+        "</tr>"
+        for idx, row in enumerate(tracked, 1)
     )
     body = f"""
     <div class="topbar">
       <div>
-        <h1>Tendencias top 5</h1>
-        <div class="subtle">Criterio: equity real de cuenta reportado por Hyperliquid</div>
+        <h1>Whale Analyzer</h1>
+        <div class="subtle">Objetivo: convertir el comportamiento de whales en indicadores claros de entrada, salida y mercado.</div>
       </div>
     </div>
     <section class="grid metrics">
@@ -4645,11 +4669,20 @@ def trends():
       <div class="card"><div class="metric-label">Sesgo neto</div><div class="metric-value">{pct(net_ratio)}</div></div>
     </section>
     <section class="grid two">
-      <div class="card"><h2>Wallets analizadas</h2><div class="grid">{cards or '<div class="subtle">Sin wallets para analizar.</div>'}</div></div>
+      <div class="card">
+        <h2>Wallets analizadas</h2>
+        <div class="subtle">Ordenadas por el parametro de seleccion: equity real de cuenta.</div>
+        <div class="table-wrap"><table><thead><tr><th>#</th><th>Wallet</th><th>Parametro</th><th>Activas</th><th>Sesgo</th><th>Top coin</th></tr></thead><tbody>{top_rows or '<tr><td colspan="6">Sin wallets para analizar.</td></tr>'}</tbody></table></div>
+      </div>
       <div class="card"><h2>Coins dominantes</h2><div class="bars">{coin_bars or '<div class="subtle">Sin posiciones para comparar.</div>'}</div></div>
     </section>
+    <section class="card" style="margin-top:16px;">
+      <h2>Wallets seguidas</h2>
+      <div class="subtle">Lista base para el analisis operativo. Luego agregaremos senales de entrada, salida, concentracion, timing y consenso.</div>
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>Wallet</th><th>Equity</th><th>Activas</th><th>Sesgo</th><th>Top coin</th><th>Seguida desde</th></tr></thead><tbody>{tracked_rows or '<tr><td colspan="7">Aun no hay wallets seguidas.</td></tr>'}</tbody></table></div>
+    </section>
     """
-    return render_layout("Tendencias", body, "trends")
+    return render_layout("Whale Analyzer", body, "trends")
 
 
 class AppHandler(BaseHTTPRequestHandler):

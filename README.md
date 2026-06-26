@@ -2,6 +2,10 @@
 
 Sistema web simple para rastrear wallets de Hyperliquid desde trades en vivo y wallets semilla, guardar las cuentas con balance mayor o igual a USD 250,000 en SQLite y analizar sus posiciones.
 
+## Objetivo del producto
+
+El fin ultimo de la aplicacion es transformar el comportamiento de whales en indicadores claros para decidir cuando entrar, cuando salir y en que mercado/moneda actuar. Cada vista nueva debe acercarse a ese objetivo: menos datos sueltos, mas senales operables.
+
 ## Ejecutar localmente
 
 ```bash
@@ -44,7 +48,7 @@ Solo se guardan en la base las wallets cuyo `accountValue` sea mayor o igual a `
 - Wallets: listado filtrable por direccion, coin y sesgo.
 - Actividad: aperturas y cierres detectados en wallets guardadas.
 - Perfil de wallet: alias editable, balance, posiciones, exposicion, snapshots y detalle por moneda.
-- Tendencias: analisis del top 5 por balance neto + margen usado en posiciones.
+- Whale Analyzer: analisis de whales por criterio de seleccion, wallets seguidas y futuras senales operables.
 
 ## Modo semi real-time
 
@@ -80,7 +84,8 @@ AUTO_DISCOVERY_INTERVAL=180
 AUTO_REFRESH_INTERVAL=5
 AUTO_REFRESH_BATCH=5
 TRACKED_REFRESH_INTERVAL=1
-TRACKED_FILL_SYNC_INTERVAL=2
+TRACKED_FILL_SYNC_INTERVAL=1
+TRACKED_LEDGER_SYNC_INTERVAL=1
 TRACKED_MAX_WALLETS=5
 POSITION_CLOSE_CONFIRMATIONS=2
 MARK_WS_ENABLED=1
