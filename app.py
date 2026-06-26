@@ -434,6 +434,13 @@ def init_db():
         ensure_column(conn, "fill_sync_state", "last_error", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "fill_sync_state", "last_inserted", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "fill_sync_state", "last_seen_fills", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "ledger_updates", "amount_usdc", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "ledger_updates", "flow_usdc", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "ledger_updates", "fee_usdc", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "ledger_updates", "token", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "ledger_updates", "counterparty", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "ledger_updates", "source_dex", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "ledger_updates", "destination_dex", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "ledger_sync_state", "last_attempt_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "ledger_sync_state", "last_error", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "ledger_sync_state", "last_inserted", "INTEGER NOT NULL DEFAULT 0")
@@ -1608,7 +1615,7 @@ def sync_wallet_fills(address, force_rebuild=False):
     attempted_at = now_iso()
     with connect_db() as conn:
         state = conn.execute(
-            "SELECT last_time_ms FROM fill_sync_state WHERE wallet_address = ?",
+            "SELECT * FROM fill_sync_state WHERE wallet_address = ?",
             (address,),
         ).fetchone()
         start_ms = int(state["last_time_ms"]) + 1 if state else 0
@@ -1691,10 +1698,10 @@ def sync_wallet_ledger(address):
     attempted_at = now_iso()
     with connect_db() as conn:
         state = conn.execute(
-            "SELECT last_time_ms FROM ledger_sync_state WHERE wallet_address = ?",
+            "SELECT * FROM ledger_sync_state WHERE wallet_address = ?",
             (address,),
         ).fetchone()
-        start_ms = int(state["last_time_ms"]) + 1 if state else 0
+        start_ms = int(row_value(state, "last_time_ms", 0)) + 1 if state else 0
 
     total_inserted = 0
     total_seen = 0
@@ -1729,8 +1736,8 @@ def sync_wallet_ledger(address):
                 """,
                 (
                     address,
-                    int(state["last_time_ms"]) if state else 0,
-                    state["synced_at"] if state else "",
+                    int(row_value(state, "last_time_ms", 0)) if state else 0,
+                    row_value(state, "synced_at", "") if state else "",
                     attempted_at,
                     str(exc)[:400],
                     total_seen,
@@ -1756,6 +1763,41 @@ def sync_wallet_ledger(address):
             (address, max(max_seen, end_ms - 1), now_iso(), attempted_at, total_inserted, total_seen),
         )
     return total_inserted
+
+
+def reset_all_pnl_graphs():
+    reset_at = now_iso()
+    with connect_db() as conn:
+        conn.execute("DELETE FROM wallet_snapshots")
+        conn.execute("DELETE FROM ledger_updates")
+        conn.execute("DELETE FROM ledger_sync_state")
+        wallets = conn.execute(
+            """
+            SELECT address, account_value, total_ntl_pos, gross_exposure,
+                   long_value, short_value, active_positions
+            FROM wallets
+            """
+        ).fetchall()
+        for wallet in wallets:
+            conn.execute(
+                """
+                INSERT INTO wallet_snapshots (
+                    wallet_address, account_value, total_ntl_pos, gross_exposure,
+                    long_value, short_value, active_positions, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wallet["address"],
+                    wallet["account_value"],
+                    wallet["total_ntl_pos"],
+                    wallet["gross_exposure"],
+                    wallet["long_value"],
+                    wallet["short_value"],
+                    wallet["active_positions"],
+                    reset_at,
+                ),
+            )
+    return len(wallets)
 
 
 def sync_saved_wallet_fills(batch_size=None):
@@ -3909,6 +3951,11 @@ def dashboard(message=""):
         <div class="subtle">Ultimo escaneo: {html.escape(scan_copy)}</div>
         <div class="subtle">Worker: live {html.escape(peru_status_text(AUTO_STATUS['last_tracked']) or 'sin wallets seguidas')} | refresh {html.escape(peru_status_text(AUTO_STATUS['last_refresh']) or 'pendiente')} | fills {html.escape(peru_status_text(AUTO_STATUS['last_fill_sync']) or 'pendiente')} | ledger {html.escape(peru_status_text(AUTO_STATUS['last_ledger_sync']) or 'pendiente')} | discovery {html.escape(peru_status_text(AUTO_STATUS['last_discovery']) or 'pendiente')}</div>
       </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start;">
+        <form method="post" action="/reset-pnl" class="card" style="box-shadow:none; padding:12px;">
+          <button class="btn secondary" type="submit">Reset PnL</button>
+        </form>
+      </div>
       <form method="post" action="/scan" class="card" style="width:min(520px,100%); box-shadow:none;">
         <div class="form-row">
           <textarea name="wallets" placeholder="0x... 0x..."></textarea>
@@ -4528,6 +4575,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if not self.is_authed():
             self.redirect("/login")
+            return
+        if parsed.path == "/reset-pnl":
+            count = reset_all_pnl_graphs()
+            msg = f"Graficos de PnL reiniciados: {count} wallets con nuevo snapshot base. Ledger local limpiado."
+            self.redirect("/?message=" + urllib.parse.quote(msg))
             return
         if parsed.path.startswith("/wallet/") and parsed.path.endswith("/name"):
             address = urllib.parse.unquote(parsed.path.split("/wallet/", 1)[1].rsplit("/name", 1)[0]).lower()
