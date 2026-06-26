@@ -2605,7 +2605,7 @@ def render_account_pnl_chart(snapshots, address):
 
     equity_delta = [value - base_value for value in values]
     adjusted_pnl = [delta - flow for delta, flow in zip(equity_delta, flow_points)]
-    all_values = equity_delta + flow_points + adjusted_pnl + [0.0]
+    all_values = adjusted_pnl + [0.0]
     min_pnl = min(all_values)
     max_pnl = max(all_values)
     span = max(max_pnl - min_pnl, 1)
@@ -2640,13 +2640,11 @@ def render_account_pnl_chart(snapshots, address):
       </div>
       <svg viewBox="0 0 {width} {height}" role="img" aria-label="Grafico de PnL ajustado de cuenta" style="width:100%; height:240px;">
         <line x1="{pad_x}" y1="{zero_y:.1f}" x2="{width - pad_x}" y2="{zero_y:.1f}" stroke="#dfe5ef" stroke-width="1" />
-        <polyline points="{make_points(equity_delta)}" fill="none" stroke="#4f6bed" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
-        <polyline points="{make_points(flow_points)}" fill="none" stroke="#8f5bd7" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 5" />
         <polyline points="{make_points(adjusted_pnl)}" fill="none" stroke="#14865f" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
         <text x="{pad_x}" y="18" fill="#647086" font-size="12">Base equity {full_usd(base_value)}</text>
         <text x="{width - pad_x}" y="18" text-anchor="end" fill="#14865f" font-size="12">PnL ajustado {('+' if last_adjusted > 0 else '') + full_usd(abs(last_adjusted))}</text>
       </svg>
-      <div class="subtle">Azul: cambio de accountValue. Morado punteado: entradas/salidas netas detectadas. Verde: cambio de equity descontando flujo externo. Movimientos ledger en ventana: {ledger_summary['events']}.</div>
+      <div class="subtle">Linea verde: cambio de equity descontando entradas/salidas detectadas. Los flujos no-trading se muestran aparte en Movimientos de capital. Movimientos ledger en ventana: {ledger_summary['events']}.</div>
     """
 
 
@@ -4303,8 +4301,15 @@ def wallet_profile(address, message=""):
       {render_trade_episodes_table(trade_stats['recent'])}
     </section>
     <section class="card" style="margin-top:16px;">
-      <h2>PnL ajustado por flujos</h2>
-      <div class="subtle">USDC base de Hyperliquid perps. PnL ajustado = cambio de accountValue - entradas/salidas detectadas por ledger.</div>
+      <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+        <div>
+          <h2>PnL ajustado por flujos</h2>
+          <div class="subtle">USDC base de Hyperliquid perps. PnL ajustado = cambio de accountValue - entradas/salidas detectadas por ledger.</div>
+        </div>
+        <form method="post" action="/reset-pnl">
+          <button class="btn secondary" type="submit">Reset PnL</button>
+        </form>
+      </div>
       {render_account_pnl_chart(chart_snapshots, address)}
     </section>
     <section class="card" style="margin-top:16px;">
