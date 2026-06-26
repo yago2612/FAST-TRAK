@@ -46,3 +46,7 @@ services:
         value: "1"
       - key: LEDGER_SYNC_INTERVAL
         value: "120"
+      - key: LEDGER_INITIAL_LOOKBACK_DAYS
+        value: "30"
+      - key: HYPERLIQUID_API_RETRIES
+        value: "3"

@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,6 +44,8 @@ FILL_SYNC_BATCH = int(os.getenv("FILL_SYNC_BATCH", "10"))
 FILL_SYNC_TOP_N = int(os.getenv("FILL_SYNC_TOP_N", "10"))
 LEDGER_SYNC_ENABLED = os.getenv("LEDGER_SYNC_ENABLED", "1") == "1"
 LEDGER_SYNC_INTERVAL = int(os.getenv("LEDGER_SYNC_INTERVAL", "120"))
+LEDGER_INITIAL_LOOKBACK_DAYS = int(os.getenv("LEDGER_INITIAL_LOOKBACK_DAYS", "30"))
+API_RETRIES = int(os.getenv("HYPERLIQUID_API_RETRIES", "3"))
 WHALE_VIEW_MIN_TRADES = int(os.getenv("WHALE_VIEW_MIN_TRADES", "10"))
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
@@ -479,14 +482,31 @@ def read_session(cookie_header):
 
 def hyperliquid_info(payload):
     body = json.dumps(payload).encode()
-    request = urllib.request.Request(
-        INFO_URL,
-        data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "simple-tracker-whale/1.0"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return json.loads(response.read().decode())
+    last_error = None
+    for attempt in range(max(1, API_RETRIES)):
+        request = urllib.request.Request(
+            INFO_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "simple-tracker-whale/1.0",
+                "Accept": "application/json",
+                "Connection": "close",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code not in {429, 500, 502, 503, 504}:
+                raise
+        except (urllib.error.URLError, ConnectionResetError, TimeoutError, http.client.HTTPException) as exc:
+            last_error = exc
+        if attempt < max(1, API_RETRIES) - 1:
+            time.sleep(0.6 * (attempt + 1))
+    raise RuntimeError(f"Hyperliquid API no respondio despues de {max(1, API_RETRIES)} intentos: {last_error}")
 
 
 def update_mark_price_cache(prices, source):
@@ -1701,7 +1721,10 @@ def sync_wallet_ledger(address):
             "SELECT * FROM ledger_sync_state WHERE wallet_address = ?",
             (address,),
         ).fetchone()
-        start_ms = int(row_value(state, "last_time_ms", 0)) + 1 if state else 0
+        if state:
+            start_ms = int(row_value(state, "last_time_ms", 0)) + 1
+        else:
+            start_ms = max(0, end_ms - int(LEDGER_INITIAL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000))
 
     total_inserted = 0
     total_seen = 0
