@@ -4272,6 +4272,15 @@ def wallet_profile(address, message=""):
         (str(row_value(row, "coin", "")), str(row_value(row, "side", ""))): row
         for row in trade_stats["open"]
     }
+    positions = sorted(
+        positions,
+        key=lambda pos: int(to_float(row_value(
+            open_by_position.get((str(pos["coin"]), str(pos["side"]))),
+            "opened_at_ms",
+            0,
+        ))),
+        reverse=True,
+    )
     fill_state = q_one("SELECT * FROM fill_sync_state WHERE wallet_address = ?", (address,))
     ledger_state = q_one("SELECT * FROM ledger_sync_state WHERE wallet_address = ?", (address,))
     ledger_start_ms = iso_to_epoch_ms(chart_snapshots[0]["created_at"]) if chart_snapshots else 0
