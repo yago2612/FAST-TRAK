@@ -89,10 +89,14 @@ FILL_SYNC_ENABLED=1
 FILL_SYNC_INTERVAL=60
 FILL_SYNC_BATCH=10
 FILL_SYNC_TOP_N=10
+LEDGER_SYNC_ENABLED=1
+LEDGER_SYNC_INTERVAL=120
 HYPERLIQUID_INFO_URL=https://api.hyperliquid.xyz/info
 HYPERLIQUID_WS_URL=wss://api.hyperliquid.xyz/ws
 HYPERLIQUID_SEED_WALLETS=0x...
 ```
+
+Hyperliquid perps usa USDC como moneda base de margen/PnL/fees. El ledger se guarda en USDC para separar entradas/salidas de capital del PnL ajustado.
 
 ## Render
 

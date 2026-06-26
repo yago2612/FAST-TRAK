@@ -42,3 +42,7 @@ services:
         value: "10"
       - key: FILL_SYNC_TOP_N
         value: "10"
+      - key: LEDGER_SYNC_ENABLED
+        value: "1"
+      - key: LEDGER_SYNC_INTERVAL
+        value: "120"
