@@ -4595,10 +4595,8 @@ def trends():
         SELECT *
         FROM wallets
         WHERE tracked = 1
-        ORDER BY tracked_at ASC, account_value DESC
-        LIMIT ?
+        ORDER BY tracked_at DESC, account_value DESC
         """,
-        (max(1, TRACKED_MAX_WALLETS),),
     )
     total_long = sum(row["long_value"] for row in top)
     total_short = sum(row["short_value"] for row in top)
@@ -4678,7 +4676,7 @@ def trends():
     </section>
     <section class="card" style="margin-top:16px;">
       <h2>Wallets seguidas</h2>
-      <div class="subtle">Lista base para el analisis operativo. Luego agregaremos senales de entrada, salida, concentracion, timing y consenso.</div>
+      <div class="subtle">Lista base para el analisis operativo. Mostrando {len(tracked)} wallets marcadas; el worker live prioriza hasta {TRACKED_MAX_WALLETS} por ciclo para no saturar llamadas.</div>
       <div class="table-wrap"><table><thead><tr><th>#</th><th>Wallet</th><th>Equity</th><th>Activas</th><th>Sesgo</th><th>Top coin</th><th>Seguida desde</th></tr></thead><tbody>{tracked_rows or '<tr><td colspan="7">Aun no hay wallets seguidas.</td></tr>'}</tbody></table></div>
     </section>
     """
