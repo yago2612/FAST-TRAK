@@ -2306,6 +2306,47 @@ def render_layout(title, body, active="dashboard", message=""):
       cursor: pointer;
     }}
     .btn.secondary {{ background: #e7ecf5; color: #182033; }}
+    dialog.wallet-dialog {{
+      width: min(680px, calc(100vw - 28px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 24px 70px rgba(24,32,51,.22);
+      padding: 0;
+      color: var(--ink);
+    }}
+    dialog.wallet-dialog::backdrop {{ background: rgba(17,24,39,.38); }}
+    .dialog-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      padding: 18px 18px 10px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .dialog-body {{ padding: 12px 18px 18px; }}
+    .icon-btn {{
+      width: 34px;
+      min-height: 34px;
+      border: 0;
+      border-radius: 8px;
+      background: #e7ecf5;
+      color: #182033;
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+    }}
+    details.fold > summary {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      cursor: pointer;
+      list-style: none;
+    }}
+    details.fold > summary::-webkit-details-marker {{ display: none; }}
+    details.fold > summary:after {{ content: "Abrir"; color: var(--blue); font-size: 12px; font-weight: 850; text-transform: uppercase; }}
+    details.fold[open] > summary:after {{ content: "Cerrar"; }}
+    details.fold .fold-content {{ margin-top: 14px; }}
     input, textarea {{
       width: 100%;
       border: 1px solid var(--line);
@@ -4357,28 +4398,34 @@ def wallet_profile(address, message=""):
       <div class="card"><div class="metric-label">Sesgo</div><div class="metric-value">{badge(wallet['direction_bias'])}</div></div>
       <div class="card"><div class="metric-label">ROI sobre margen</div><div class="metric-value">{signed_pct(total_pnl / total_capital if total_capital else 0)}</div></div>
     </section>
-    <section class="card">
-      <h2>Detalle</h2>
-      <table><tbody>
-        <tr><th>Equity real cuenta</th><td>{usd(wallet['account_value'])}</td></tr>
-        <tr><th>Capital en posiciones</th><td>{usd(total_capital)}</td></tr>
-        <tr><th>Reserva disponible</th><td>{usd(reserve_available)}</td></tr>
-        <tr><th>Buffer/no disponible</th><td>{usd(locked_or_buffer)}</td></tr>
-        <tr><th>Margen usado API</th><td>{usd(wallet['margin_used'])}</td></tr>
-        <tr><th>Notional abierto</th><td>{usd(wallet['total_ntl_pos'])}</td></tr>
-        <tr><th>Posiciones activas</th><td>{int(wallet['active_positions'])}</td></tr>
-        <tr><th>Exposicion neta</th><td>{signed_full_usd(wallet['net_exposure'])}</td></tr>
-        <tr><th>Exposicion long</th><td>{usd(wallet['long_value'])}</td></tr>
-        <tr><th>Exposicion short</th><td>{usd(wallet['short_value'])}</td></tr>
-        <tr><th>Diversificacion</th><td>{pct(wallet['diversification_score'])}</td></tr>
-        <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
-        <tr><th>Ultima lectura</th><td>{html.escape(peru_time_text(wallet['last_seen']))}</td></tr>
-        <tr><th>Modo live</th><td>{'Seguida: posiciones ~' + str(TRACKED_REFRESH_INTERVAL) + 's, fills ~' + str(TRACKED_FILL_SYNC_INTERVAL) + 's, ledger ~' + str(TRACKED_LEDGER_SYNC_INTERVAL) + 's' if is_tracked else 'Normal'}</td></tr>
-        <tr><th>Ultimo sync fills</th><td>{html.escape(fill_sync_status(fill_state))}</td></tr>
-        <tr><th>Ultimo sync ledger</th><td>{html.escape(ledger_sync_status(ledger_state))}</td></tr>
-      </tbody></table>
-      <div class="subtle" style="margin-top:10px;">El modo live refresca posiciones, fills y ledger automaticamente para las wallets seguidas. Los trades cerrados y winrate se confirman con fills reales.</div>
+    <section style="display:flex; justify-content:flex-end; margin-bottom:16px;">
+      <button class="btn secondary" type="button" onclick="document.getElementById('wallet-detail-dialog').showModal()">Ver detalle</button>
     </section>
+    <dialog class="wallet-dialog" id="wallet-detail-dialog">
+      <div class="dialog-head">
+        <div>
+          <h2>Detalle wallet</h2>
+          <div class="subtle">{html.escape(short_addr(address))}</div>
+        </div>
+        <button class="icon-btn" type="button" title="Cerrar" onclick="document.getElementById('wallet-detail-dialog').close()">x</button>
+      </div>
+      <div class="dialog-body">
+        <table><tbody>
+          <tr><th>Equity</th><td>{usd(wallet['account_value'])}</td></tr>
+          <tr><th>Capital en posiciones</th><td>{usd(total_capital)}</td></tr>
+          <tr><th>Reserva disponible</th><td>{usd(reserve_available)}</td></tr>
+          <tr><th>Buffer/no disponible</th><td>{usd(locked_or_buffer)}</td></tr>
+          <tr><th>Notional abierto</th><td>{usd(wallet['total_ntl_pos'])}</td></tr>
+          <tr><th>Posiciones activas</th><td>{int(wallet['active_positions'])}</td></tr>
+          <tr><th>Sesgo</th><td>{badge(wallet['direction_bias'])}</td></tr>
+          <tr><th>Top coin</th><td>{html.escape(wallet['top_coin'] or '-')}</td></tr>
+          <tr><th>Ultima lectura</th><td>{html.escape(peru_time_text(wallet['last_seen']))}</td></tr>
+          <tr><th>Modo live</th><td>{'Seguida: posiciones ~' + str(TRACKED_REFRESH_INTERVAL) + 's, fills ~' + str(TRACKED_FILL_SYNC_INTERVAL) + 's, ledger ~' + str(TRACKED_LEDGER_SYNC_INTERVAL) + 's' if is_tracked else 'Normal'}</td></tr>
+          <tr><th>Sync fills</th><td>{html.escape(fill_sync_status(fill_state))}</td></tr>
+          <tr><th>Sync ledger</th><td>{html.escape(ledger_sync_status(ledger_state))}</td></tr>
+        </tbody></table>
+      </div>
+    </dialog>
     <section class="card" style="margin-top:16px;">
       <h2>Trading analytics</h2>
       <div class="grid three">
@@ -4392,16 +4439,24 @@ def wallet_profile(address, message=""):
         <div><div class="metric-label">Profit factor</div><div class="metric-value">{trade_stats['all']['profit_factor']:.2f}</div></div>
       </div>
     </section>
-    <section class="card" style="margin-top:16px;">
-      <h2>Posiciones actuales + fills</h2>
-      <div class="subtle">Fuente viva: posiciones actuales de Hyperliquid. Los fills solo estiman apertura, escalados, fees y cobertura historica.</div>
-      {render_open_trade_episodes_table(trade_stats['open'])}
-    </section>
-    <section class="card" style="margin-top:16px;">
-      <h2>Trades cerrados reales</h2>
-      <div class="subtle">Reconstruido desde userFillsByTime. PnL neto = closedPnl - fee total reportada por Hyperliquid.</div>
-      {render_trade_episodes_table(trade_stats['recent'])}
-    </section>
+    <details class="card fold" style="margin-top:16px;">
+      <summary>
+        <div>
+          <h2>Posiciones actuales + fills</h2>
+          <div class="subtle">Fuente viva: posiciones actuales de Hyperliquid. Los fills solo estiman apertura, escalados, fees y cobertura historica.</div>
+        </div>
+      </summary>
+      <div class="fold-content">{render_open_trade_episodes_table(trade_stats['open'])}</div>
+    </details>
+    <details class="card fold" style="margin-top:16px;">
+      <summary>
+        <div>
+          <h2>Trades cerrados reales</h2>
+          <div class="subtle">Reconstruido desde userFillsByTime. PnL neto = closedPnl - fee total reportada por Hyperliquid.</div>
+        </div>
+      </summary>
+      <div class="fold-content">{render_trade_episodes_table(trade_stats['recent'])}</div>
+    </details>
     <section class="card" style="margin-top:16px;">
       <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
         <div>
